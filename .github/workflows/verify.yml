@@ -1,0 +1,23 @@
+name: Verify source package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # verified v4
+      - name: Check source publication boundary
+        run: python3 scripts/check-package.py
+      - name: Check script syntax
+        run: |
+          python3 -m py_compile scripts/*.py tests/*.py
+          bash -n scripts/build.sh scripts/run.sh scripts/setup-prefix.sh
+      - name: Fetch pinned Wine source and verify patch
+        run: |
+          curl --fail --location --retry 3 https://github.com/wine-mirror/wine/archive/refs/tags/wine-11.18.tar.gz -o /tmp/wine-11.18.tar.gz
+          python3 scripts/verify-patch.py /tmp/wine-11.18.tar.gz
+      # Full runtime/game tests require a Mac and privately supplied dependencies.

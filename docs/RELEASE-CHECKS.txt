@@ -1,0 +1,96 @@
+Release checks — October 13–14, 2026
+
+PASS: Six pinned input SHA-256 checksums verified.
+PASS: Fresh Wine 11.18 extraction, zero-fuzz patch application, all 39 source hashes.
+PASS: Complete fresh main Wine build and installation using repository build.sh.
+PASS: Separate media build and selected-module installation using repository scripts.
+PASS: Local framework preparation and 13-plugin selection using repository prepare.py.
+PASS: Fresh isolated prefix setup, Vulkan registry setting and both winegstreamer registrations.
+PASS: Fresh-runtime Windows x64 and x86 command execution.
+PASS: Fresh-runtime raw syscall suite: actual event, invalid-handle failure, system time and six-argument memory query.
+PASS: Configured no_create_flags rejects video-device creation with E_FAIL while ordinary graphics succeed.
+PASS: Fresh-runtime ARGB32 GPU decode: three changing nonblack 1600x1600 frames, opaque alpha, shader-resource views and readback.
+PASS: Native Applications starter compiles, installs, signs and starts the official launcher without Terminal.
+PASS: The user-selected SteamGridDB icon 44284 is visible in Finder; app signature verifies.
+PASS: Official launcher outline absent at normal and maximized sizes; maximize/restore input works.
+PASS: Applications-app runner's official Launch reaches original protected game startup, title movie, NA authentication and saved field.
+PASS: Published tests/smoke.py compiles its own fixtures and passes all three API checks on the fresh runtime.
+PASS: Shell/Python script syntax and standalone patch verifier.
+PASS: Local documentation links and source-package privacy checks.
+
+Fresh build/API validation ran on the same M3 Pro/macOS 27 machine with the tested dependency donor.
+The fresh prefix used only a private movie fixture, not a copied account installation.
+A second complete game download/sign-in in that prefix and end-to-end installation on another Mac were not repeated.
+The installed Applications app continues using the existing verified isolated setup.
+A harmless GStreamer caps warning was emitted while the video fixture nevertheless returned actual changing frames.
+GitHub CI configuration is supplied; no remote GitHub run or publication is claimed.
+No account-bearing logs, prefixes, game/ACE binaries or third-party icon artwork are included in this repository.
+
+Dock icon update: native Mac driver rebuilt successfully in both the installed and fresh-build trees; combined patch now changes 39 files. The earlier complete main/media build remains the base, with this native icon preference rebuilt afterward.
+PASS: Dock icon installer sets identical ICNS files, native bundle preference and signed metadata for NIKKE Launcher/NIKKE. Re-running bundle preparation preserves both icons.
+
+Oct14 display/graphics refresh:
+PASS: 39-file patch against pristine Wine 11.18, zero fuzz and exact final source hashes.
+PASS: Fresh patched-source main and selected media build/install targets, using the previously validated build cache.
+PASS: Rebuilt source tree agrees with every published final source hash.
+PASS: Refreshed prefix setup and both codec registrations.
+PASS: Raw syscall, video-only fallback and changing opaque GPU-video checks on the base route.
+PASS: Same three checks on the private DXMT route, selected only for owned fixtures.
+PASS: Published DXMT installer copies game-scoped private modules; rollback restores prior files, marker and overrides; reinstall/API checks pass.
+PASS: Actual native game backbuffer/drawable 3024 x 1964 / scale 2 / sRGB SDR.
+PASS: Known-color and one-physical-pixel fixture; no physical-panel calibration claim.
+PASS: Original True Tone/ProMotion/Night Shift/XDR display settings restored via System Settings.
+OPEN: Constant 60 fps. Valid combat samples still contain missed frames; see DISPLAY-PERFORMANCE.md.
+Game Mode activation and a scheduling QoS performance benefit are not claimed.
+No CPU/deadline drawable pacer, async MoltenVK default or MetalFX upscaling is shipped.
+
+PASS: Updated native metrics observer preserves an existing sentinel file and creates a unique recording with positive actual presentation times on the owned DXMT color fixture.
+PASS: Final native driver rebuild on the fresh validation source; all 39 hashes agree.
+PASS: Final three API/video smoke checks repeated after the safe recording change.
+REJECTED: All-worker QoS extension (source/installed native ntdll restored); 120 Hz Metal limit as a constant-60 solution.
+
+PASS: Final fixed60-Hz/native/Basic-character combat phase verified at both screenshot endpoints.
+OPEN: That boss sample measured56.88fps/p9933.33ms/worst250ms; fixed60Hz is not a sufficient fix.
+PASS: ProMotion restored again via CUA after the final comparison; other display settings preserved.
+
+
+Oct14 review/publication refresh:
+PASS: Experimental GPTK trees/prefixes/backends/checkpoints/logs/reports removed.
+PASS: Shared source inputs and original DXMT baseline preserved during removal.
+PASS: Reviewed ntoskrnl.exe/kernelbase.dll builds, x64 and x86; prior files checkpointed.
+PASS: Current packaged account-free kernel suite, including allocation-wide MDL and fixed-address cases.
+PASS: Scoped CEF command-line suite7/7, other image/default/partial/duplicate cases.
+PASS: Valid/invalid NOP suite8/8; actual context/process/driver/thread/work-item regressions.
+PASS: Updated DXMT raw-syscall, video-device fallback and changing opaque GPU-video checks.
+PASS: Current39-file zero-fuzz patch and exact source hash verifier.
+PASS: Existing Applications starter runner updated; icon retained; strict signature verification.
+PASS (user-confirmed): Updated official launcher Launch reaches the lobby.
+PENDING: A newly issued real CAPTCHA in this DXMT build; owned scoped-switch tests pass.
+No claim of a new full clean build, GitHub CI run, new combat FPS measurement, account safety or publisher approval.
+
+Oct14 public naming/update assessment:
+PASS: Unofficial Launcher for NIKKE native starter compiles and signs in a private test root.
+PASS: Both unofficial Wine host labels and identical original icons persist after bundle preparation.
+PASS: Owned 32-bit launcher/helper replacement, exit and restart, then replaced 64-bit game launch.
+PASS: Inherited environment, video/DLL settings, owned preferences and sampled runtime hashes retained.
+PASS: Installed official launcher/game destinations are writable; all40 working baseline hashes unchanged.
+UNVERIFIED: Actual official version-to-version update and future launcher/CEF/ACE compatibility.
+Computer Use returned not approved for NIKKE Launcher; no new update-prompt capture or actual upgrade is claimed.
+
+Oct14 launcher minimized shadows and separate DPI:
+PASS: Actual minimized launcher identified: iconic root plus4 visible owned shadow tool windows.
+PASS: Old native module reproduces4 orphans; revised module leaves0 and restores only still-visible popups.
+PASS: New native Mac driver builds; source/header and old module checkpointed, module atomically installed.
+PASS: Published account-free native window regression against the installed module, including3 helper DPI probes.
+PASS: Split prefix profile keeps native monitor coordinates while launcher/helpers render at standard DPI.
+PASS: Actual launcher capture fills1348x904points; sign-in retained after restart.
+PASS: Actual launcher browser backbuffer1346x902 measured by existing render-size observer; physical window2696x1808.
+PASS: Public standard/96-DPI mode integration sets/removes all4 image options and retains RetinaModeY.
+PASS: Same-profile owned DXMT game fixture backbuffer/capture3024x1964, native1physical-pixel stripes.
+PASS: Standard-DPI fixture uses2physical-pixel stripes on the tested Retina display.
+PASS: Installed DXMT raw syscall, video-only fallback and3changing opaque GPU frames.
+PASS: Current39-file patch applies with zero fuzz and exact source hashes.
+PASS (user-confirmed): Real launcher shadow box disappears after minimize/restore; game launches with Retina rendering.
+PASS: Native window list shows minimized launcher and all4 shadow windows offscreen.
+PASS: Actual game Metal drawable2874x1616pixels /1437x808content points, backing scale2.0 in its current window.
+No new combatFPS, complete clean rebuild, publisher approval or full ACE parity claim.

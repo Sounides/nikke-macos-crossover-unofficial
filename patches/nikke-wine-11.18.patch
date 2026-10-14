@@ -1,0 +1,3297 @@
+--- a/dlls/d3d11/d3d11_main.c
++++ b/dlls/d3d11/d3d11_main.c
+@@ -142,6 +142,31 @@
+     return S_OK;
+ }
+ 
++#ifdef _WIN64
++static INIT_ONCE dxmt_once = INIT_ONCE_STATIC_INIT;
++static HMODULE dxmt_backend;
++static BOOL CALLBACK init_dxmt_backend(INIT_ONCE *once, void *param, void **context)
++{
++    dxmt_backend = LoadLibraryW(L"nikke_dxmt.dll");
++    return TRUE;
++}
++static BOOL use_dxmt_backend(void)
++{
++    WCHAR enabled[2], path[MAX_PATH], target[MAX_PATH];
++    const WCHAR *name;
++    DWORD length;
++    if (GetEnvironmentVariableW(L"NIKKE_DXMT", enabled, ARRAY_SIZE(enabled)) != 1 || enabled[0] != '1') return FALSE;
++    length = GetModuleFileNameW(NULL, path, ARRAY_SIZE(path));
++    if (!length || length >= ARRAY_SIZE(path)) return FALSE;
++    name = wcsrchr(path, '\\');
++    name = name ? name + 1 : path;
++    length = GetEnvironmentVariableW(L"NIKKE_DXMT_TARGET", target, ARRAY_SIZE(target));
++    if (length >= ARRAY_SIZE(target)) return FALSE;
++    if (!length) wcscpy(target, L"nikke.exe");
++    return !wcsicmp(name, target);
++}
++#endif
++
+ static HRESULT d3d11_create_device(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type, HMODULE swrast, UINT flags,
+         const D3D_FEATURE_LEVEL *feature_levels, UINT levels, UINT sdk_version, ID3D11Device **device_out,
+         D3D_FEATURE_LEVEL *obtained_feature_level, ID3D11DeviceContext **immediate_context)
+@@ -170,6 +195,24 @@
+         *obtained_feature_level = 0;
+     if (immediate_context)
+         *immediate_context = NULL;
++
++#ifdef _WIN64
++    /* Optional external Metal backend. Keep unsupported GPU video requests on
++     * the tested software-decoder path, with ordinary graphics forwarded intact. */
++    {
++        if (use_dxmt_backend())
++        {
++            typedef HRESULT (WINAPI *create_device_fn)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
++                    const D3D_FEATURE_LEVEL *, UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
++            create_device_fn create;
++            if (flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT) return E_FAIL;
++            InitOnceExecuteOnce(&dxmt_once, init_dxmt_backend, NULL, NULL);
++            if (!dxmt_backend || !(create = (create_device_fn)GetProcAddress(dxmt_backend, "D3D11CreateDevice"))) return E_FAIL;
++            return create(adapter, driver_type, swrast, flags, feature_levels, levels,
++                    sdk_version, device_out, obtained_feature_level, immediate_context);
++        }
++    }
++#endif
+ 
+     if (adapter)
+     {
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -5009,6 +5009,33 @@
+             return d3d11_device_CheckFormatSupport(iface, data->InFormat, &data->OutFormatSupport);
+         }
+ 
++        case D3D11_FEATURE_FORMAT_SUPPORT2:
++        {
++            D3D11_FEATURE_DATA_FORMAT_SUPPORT2 *data = feature_support_data;
++            UINT support;
++
++            if (!data || feature_support_data_size != sizeof(*data))
++                return E_INVALIDARG;
++
++            data->OutFormatSupport2 = 0;
++            if (FAILED(hr = d3d11_device_CheckFormatSupport(iface, data->InFormat, &support)))
++                return hr;
++
++            /* Report the UAV operations established by the backend format query.
++             * R32 typed loads are the baseline supported by our image-load path.
++             * Additional atomics, sharing, tiling and overlay flags are not yet exposed. */
++            if (support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)
++            {
++                data->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
++                if (data->InFormat == DXGI_FORMAT_R32_FLOAT || data->InFormat == DXGI_FORMAT_R32_UINT
++                        || data->InFormat == DXGI_FORMAT_R32_SINT)
++                    data->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
++            }
++
++            TRACE("Format %u, support2 %#x.\n", data->InFormat, data->OutFormatSupport2);
++            return S_OK;
++        }
++
+         case D3D11_FEATURE_D3D9_SIMPLE_INSTANCING_SUPPORT:
+         {
+             D3D11_FEATURE_DATA_D3D9_SIMPLE_INSTANCING_SUPPORT *data = feature_support_data;
+--- a/dlls/dxgi/device.c
++++ b/dlls/dxgi/device.c
+@@ -485,7 +485,7 @@
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+-        IDXGIFactory *factory, IDXGIAdapter *adapter,
++        IDXGIFactory *factory, IDXGIAdapter *adapter, unsigned int flags,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count)
+ {
+     struct wined3d_device_parent *wined3d_device_parent;
+@@ -494,6 +494,7 @@
+     struct dxgi_adapter *dxgi_adapter;
+     struct dxgi_factory *dxgi_factory;
+     struct dxgi_output *dxgi_output;
++    unsigned int wined3d_flags = 0;
+     struct IDXGIOutput *output;
+     void *layer_base;
+     HWND window;
+@@ -540,8 +541,11 @@
+     wined3d_device_parent = IWineDXGIDeviceParent_get_wined3d_device_parent(dxgi_device_parent);
+     IWineDXGIDeviceParent_Release(dxgi_device_parent);
+ 
++    if (flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
++        wined3d_flags |= WINED3DCREATE_VIDEO_SUPPORT;
++
+     if (FAILED(hr = wined3d_device_create(dxgi_factory->wined3d,
+-            dxgi_adapter->wined3d_adapter, WINED3D_DEVICE_TYPE_HAL, NULL, 0, 4,
++            dxgi_adapter->wined3d_adapter, WINED3D_DEVICE_TYPE_HAL, NULL, wined3d_flags, 4,
+             (const enum wined3d_feature_level *)feature_levels, level_count,
+             wined3d_device_parent, &device->wined3d_device)))
+     {
+--- a/dlls/dxgi/dxgi_main.c
++++ b/dlls/dxgi/dxgi_main.c
+@@ -191,7 +191,7 @@
+         return E_OUTOFMEMORY;
+     }
+ 
+-    hr = dxgi_device_init(dxgi_device, &d3d10_layer, factory, adapter, feature_levels, level_count);
++    hr = dxgi_device_init(dxgi_device, &d3d10_layer, factory, adapter, flags, feature_levels, level_count);
+     if (FAILED(hr))
+     {
+         WARN("Failed to initialize device, hr %#lx.\n", hr);
+--- a/dlls/dxgi/dxgi_private.h
++++ b/dlls/dxgi/dxgi_private.h
+@@ -32,6 +32,7 @@
+ 
+ #include "dxgi1_6.h"
+ #include "d3d10_1.h"
++#include "d3d11.h"
+ #include "d3d12.h"
+ #ifdef DXGI_INIT_GUID
+ #include "initguid.h"
+@@ -138,7 +139,7 @@
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+-        IDXGIFactory *factory, IDXGIAdapter *adapter,
++        IDXGIFactory *factory, IDXGIAdapter *adapter, unsigned int flags,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count);
+ 
+ /* IDXGIOutput */
+--- a/dlls/dxgi/resource.c
++++ b/dlls/dxgi/resource.c
+@@ -385,8 +385,26 @@
+ /* IDXGIResource methods */
+ static HRESULT STDMETHODCALLTYPE dxgi_resource_GetSharedHandle(IDXGIResource1 *iface, HANDLE *shared_handle)
+ {
+-    FIXME("iface %p, shared_handle %p stub!\n", iface, shared_handle);
+-
++    struct dxgi_resource *resource = impl_from_IDXGIResource1(iface);
++    struct wined3d_resource_desc desc;
++
++    TRACE("iface %p, shared_handle %p.\n", iface, shared_handle);
++
++    if (!shared_handle) return E_INVALIDARG;
++    wined3d_mutex_lock();
++    wined3d_resource_get_desc(resource->wined3d_resource, &desc);
++    wined3d_mutex_unlock();
++
++    if (desc.usage & WINED3DUSAGE_SHARED_NT_HANDLE) return E_INVALIDARG;
++    /* Windows returns S_OK and NULL for an ordinary, unshared resource.
++     * No legacy handle or resource-sharing capability is created here. */
++    if (!(desc.usage & WINED3DUSAGE_SHARED))
++    {
++        *shared_handle = NULL;
++        return S_OK;
++    }
++
++    FIXME("Legacy shared resources are not implemented.\n");
+     return E_NOTIMPL;
+ }
+ 
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -138,6 +138,57 @@
+ /***********************************************************************
+  *           create_process_params
+  */
++/* CEF rendering switches documented by kanata-dp/nikke-crossover-compat,
++ * docs/UPDATE-2026-09-26.en.md, 8f3c77b131d0 (LGPL-2.1-or-later).
++ * Opt in for the verification service only; retain its official executable,
++ * authentication flow, sandbox and certificate validation. */
++static BOOL command_line_has_switch( const WCHAR *cmdline, const WCHAR *option )
++{
++    const WCHAR *match = cmdline;
++    SIZE_T length = wcslen( option );
++
++    while ((match = wcsstr( match, option )))
++    {
++        WCHAR next = match[length];
++        if ((match == cmdline || match[-1] == ' ' || match[-1] == '\t' || match[-1] == '"') &&
++            (!next || next == ' ' || next == '\t' || next == '"')) return TRUE;
++        match += length;
++    }
++    return FALSE;
++}
++
++static WCHAR *verification_command_line( const WCHAR *image, const WCHAR *cmdline )
++{
++    static const WCHAR *const options[] =
++    {
++        L"--disable-gpu", L"--disable-gpu-compositing", L"--in-process-gpu"
++    };
++    const WCHAR *base = wcsrchr( image, '\\' );
++    WCHAR flag[2], *result, *end;
++    SIZE_T length, extra = 0;
++    unsigned int i;
++
++    base = base ? base + 1 : image;
++    if (!cmdline || wcsicmp( base, L"intl_service.exe" ) ||
++        GetEnvironmentVariableW( L"NIKKE_CEF_SOFTWARE", flag, ARRAY_SIZE(flag) ) != 1 || flag[0] != '1') return NULL;
++    length = wcslen( cmdline );
++    for (i = 0; i < ARRAY_SIZE(options); ++i)
++        if (!command_line_has_switch( cmdline, options[i] )) extra += 1 + wcslen( options[i] );
++    if (!extra || length + extra > 32766) return NULL;
++    if (!(result = RtlAllocateHeap( GetProcessHeap(), 0, (length + extra + 1) * sizeof(WCHAR) ))) return NULL;
++    memcpy( result, cmdline, length * sizeof(WCHAR) );
++    end = result + length;
++    for (i = 0; i < ARRAY_SIZE(options); ++i)
++    {
++        if (command_line_has_switch( cmdline, options[i] )) continue;
++        *end++ = ' ';
++        wcscpy( end, options[i] );
++        end += wcslen( options[i] );
++    }
++    *end = 0;
++    return result;
++}
++
+ static RTL_USER_PROCESS_PARAMETERS *create_process_params( const WCHAR *filename, const WCHAR *cmdline,
+                                                            const WCHAR *cur_dir, void *env, DWORD flags,
+                                                            const STARTUPINFOW *startup )
+@@ -145,6 +196,7 @@
+     RTL_USER_PROCESS_PARAMETERS *params;
+     UNICODE_STRING imageW, curdirW, cmdlineW, titleW, desktopW, runtimeW, newdirW;
+     WCHAR imagepath[MAX_PATH];
++    WCHAR *compat_cmdline;
+     WCHAR *envW = env;
+ 
+     if (!GetLongPathNameW( filename, imagepath, MAX_PATH )) lstrcpynW( imagepath, filename, MAX_PATH );
+@@ -172,6 +224,8 @@
+     }
+     RtlInitUnicodeString( &imageW, imagepath );
+     RtlInitUnicodeString( &curdirW, cur_dir );
++    compat_cmdline = verification_command_line( imagepath, cmdline );
++    if (compat_cmdline) cmdline = compat_cmdline;
+     RtlInitUnicodeString( &cmdlineW, cmdline );
+     RtlInitUnicodeString( &titleW, startup->lpTitle ? startup->lpTitle : imagepath );
+     RtlInitUnicodeString( &desktopW, startup->lpDesktop );
+@@ -182,10 +236,12 @@
+                                       NULL, &runtimeW, PROCESS_PARAMS_FLAG_NORMALIZED ))
+     {
+         RtlFreeUnicodeString( &newdirW );
++        RtlFreeHeap( GetProcessHeap(), 0, compat_cmdline );
+         if (envW != env) RtlFreeHeap( GetProcessHeap(), 0, envW );
+         return NULL;
+     }
+     RtlFreeUnicodeString( &newdirW );
++    RtlFreeHeap( GetProcessHeap(), 0, compat_cmdline );
+ 
+     if (!(flags & CREATE_NEW_PROCESS_GROUP))
+         params->ProcessGroupId = NtCurrentTeb()->Peb->ProcessParameters->ProcessGroupId;
+@@ -685,6 +741,10 @@
+     }
+ 
+  done:
++    /* NIKKE downloader: wait for VersionService to initialize its IPC pipe. */
++    if (!status && ((app_name && wcsstr(app_name, L"VersionService.exe")) ||
++                    (cmd_line && wcsstr(cmd_line, L"VersionService.exe"))))
++        Sleep(1000);
+     RtlDestroyProcessParameters( params );
+     if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
+     return set_ntstatus( status );
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -465,6 +465,28 @@
+     if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
+ 
+     argv[1] = strdup( wineloader );
++#ifdef __APPLE__
++    {
++        const char *app_loader = getenv("NIKKE_WINE_APP_LOADER");
++        const char *app_target = getenv("NIKKE_WINE_APP_TARGET");
++        const char *helper_loader = getenv("NIKKE_WINE_HELPER_LOADER");
++
++        /* Keep non-UI service and browser subprocesses out of the selected app
++         * bundle, so native accessibility tools bind to its window owner. */
++        if (app_target && (!argv[2] || !strstr(argv[2], app_target)))
++            app_loader = helper_loader;
++        /* Use the real spawn image; its command line can start with an empty token. */
++        if (getenv("NIKKE_WINE_GAME_PROCESS"))
++        {
++            app_loader = getenv("NIKKE_WINE_GAME_APP_LOADER");
++        }
++        if (app_loader && app_loader[0] == '/' && !access(app_loader, X_OK))
++        {
++            free(argv[1]);
++            argv[1] = strdup(app_loader);
++        }
++    }
++#endif
+     preloader_exec( argv );
+     return STATUS_INVALID_IMAGE_FORMAT;
+ }
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -440,7 +440,22 @@
+                 close( unixdir );
+             }
+             argv = build_argv( &params->CommandLine, 2 );
+-
++#ifdef __APPLE__
++            /* Route the real game image separately from its launcher and helpers.
++             * The command line's first token can be empty. */
++            {
++                static const WCHAR game_image[] = {'C',':','\\','N','I','K','K','E','\\','N','I','K','K','E','\\','g','a','m','e','\\','n','i','k','k','e','.','e','x','e',0};
++                const WCHAR *image = params->ImagePathName.Buffer;
++                unsigned int len = params->ImagePathName.Length / sizeof(WCHAR);
++                BOOL game_match;
++                if (len >= 4 && image[0] == '\\' && image[1] == '?' && image[2] == '?' && image[3] == '\\')
++                { image += 4; len -= 4; }
++                game_match = len == ARRAY_SIZE(game_image) - 1 && !wcsnicmp(image, game_image, len);
++                unsetenv("NIKKE_WINE_GAME_PROCESS");
++                if (game_match && getenv("NIKKE_WINE_GAME_APP_LOADER"))
++                    setenv("NIKKE_WINE_GAME_PROCESS", "1", 1);
++            }
++#endif
+             exec_wineloader( argv, socketfd, pe_info );
+             _exit(1);
+         }
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2275,6 +2275,62 @@
+  *
+  * Handler for SIGSEGV and related errors.
+  */
++#ifdef __APPLE__
++/* Rosetta rejects some valid 0F 1F /0 encodings, including NOP ECX.
++ * Intel SDM: multi-byte NOP changes only IP and performs no memory operation.
++ * Decode only this documented opcode; LOCK and unsupported instructions retain
++ * their normal exceptions. Never modify the application's code bytes. */
++static BOOL handle_multi_byte_nop( ucontext_t *sigcontext, const CONTEXT *context )
++{
++    unsigned char bytes[15];
++    SIZE_T count;
++    unsigned int len = 0, mod, rm;
++    BOOL address_override = FALSE, address16;
++
++    count = virtual_uninterrupted_read_memory( (const void *)context->Rip, bytes, sizeof(bytes) );
++    while (len < count)
++    {
++        unsigned char prefix = bytes[len];
++        if (prefix == 0x67) address_override = TRUE;
++        else if (prefix != 0x66 && prefix != 0x26 && prefix != 0x2e &&
++                 prefix != 0x36 && prefix != 0x3e && prefix != 0x64 && prefix != 0x65 &&
++                 !(context->SegCs == cs64_sel && prefix >= 0x40 && prefix <= 0x4f))
++            break;
++        len++;
++    }
++    if (len + 3 > count || bytes[len] != 0x0f || bytes[len + 1] != 0x1f ||
++        (bytes[len + 2] & 0x38)) return FALSE;
++    mod = bytes[len + 2] >> 6;
++    rm = bytes[len + 2] & 7;
++    len += 3;
++    address16 = context->SegCs == cs32_sel && address_override;
++    if (mod != 3)
++    {
++        if (address16)
++        {
++            if (!mod && rm == 6) len += 2;
++            else if (mod == 1) len++;
++            else if (mod == 2) len += 2;
++        }
++        else
++        {
++            if (rm == 4)
++            {
++                if (len >= count) return FALSE;
++                if (!mod && (bytes[len] & 7) == 5) len += 4;
++                len++;
++            }
++            else if (!mod && rm == 5) len += 4;
++            if (mod == 1) len++;
++            else if (mod == 2) len += 4;
++        }
++    }
++    if (len > count || len > 15) return FALSE;
++    RIP_sig(sigcontext) += len;
++    return TRUE;
++}
++#endif
++
+ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+@@ -2293,6 +2349,13 @@
+         rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+         break;
+     case TRAP_x86_PRIVINFLT:   /* Invalid opcode exception */
++#ifdef __APPLE__
++        if (handle_multi_byte_nop( sigcontext, &context.c ))
++        {
++            leave_handler( data, sigcontext );
++            return;
++        }
++#endif
+         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+         break;
+     case TRAP_x86_STKFLT:  /* Stack fault */
+@@ -2648,6 +2711,11 @@
+         frame->restore_flags |= CONTEXT_CONTROL;
+     }
+     RIP_sig(sigcontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
++#ifdef __APPLE__
++    /* init_handler switched GS to the native pthread TSD. The dispatcher
++     * resumes on the application's stack and expects GS to address its TEB. */
++    leave_handler( data, sigcontext );
++#endif
+ }
+ #endif
+ 
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -3570,13 +3570,36 @@
+         {
+             "\\SystemRoot\\system32\\ntoskrnl.exe",
+             "\\SystemRoot\\system32\\hal.dll",
+-            "\\SystemRoot\\system32\\drivers\\mountmgr.sys"
+         };
+ 
+-        ULONG i;
++        ULONG i, count;
+         RTL_PROCESS_MODULES *smi = info;
+-
+-        len = offsetof( RTL_PROCESS_MODULES, Modules[ARRAY_SIZE(fake_modules)] );
++        char *buffer = NULL;
++        data_size_t buffer_size = 0, pos = 0;
++        unsigned int module_count = 0;
++
++        /* query with no buffer first, the reply tells us how much is needed */
++        SERVER_START_REQ( list_kernel_modules )
++        {
++            wine_server_set_reply( req, NULL, 0 );
++            if (wine_server_call( req ) == STATUS_INFO_LENGTH_MISMATCH)
++                buffer_size = reply->info_size;
++        }
++        SERVER_END_REQ;
++
++        if (buffer_size && (buffer = malloc( buffer_size )))
++        {
++            SERVER_START_REQ( list_kernel_modules )
++            {
++                wine_server_set_reply( req, buffer, buffer_size );
++                if (!wine_server_call( req )) module_count = reply->module_count;
++                else buffer_size = 0;
++            }
++            SERVER_END_REQ;
++        }
++
++        count = ARRAY_SIZE(fake_modules) + module_count;
++        len = offsetof( RTL_PROCESS_MODULES, Modules[count] );
+         if (len <= size)
+         {
+             memset( smi, 0, len );
+@@ -3590,10 +3613,34 @@
+                 strcpy( (char *)sm->Name, fake_modules[i] );
+                 sm->NameOffset = strrchr( fake_modules[i], '\\' ) - fake_modules[i] + 1;
+             }
+-            smi->ModulesCount = i;
++            for (i = 0; i < module_count; i++)
++            {
++                const struct kernel_module_info *km = (const struct kernel_module_info *)(buffer + pos);
++                RTL_PROCESS_MODULE_INFORMATION *sm = &smi->Modules[ARRAY_SIZE(fake_modules) + i];
++                const WCHAR *module_name = (const WCHAR *)(km + 1);
++                unsigned int name_chars = km->name_len / sizeof(WCHAR);
++                unsigned int written = 0;
++                unsigned int src;
++
++                sm->ImageBaseAddress = wine_server_get_ptr( km->base );
++                sm->ImageSize = km->size;
++                sm->LoadOrderIndex = ARRAY_SIZE(fake_modules) + i;
++                sm->LoadCount = 1;
++
++                for (src = 0; src < name_chars && written < MAXIMUM_FILENAME_LENGTH - 1; src++)
++                    sm->Name[written++] = (char)module_name[src];
++                sm->Name[written] = 0;
++                sm->NameOffset = strrchr( (char *)sm->Name, '\\' )
++                    ? strrchr( (char *)sm->Name, '\\' ) - (char *)sm->Name + 1 : 0;
++
++                pos += (sizeof(*km) + km->name_len + sizeof(client_ptr_t)-1)
++                       / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++            }
++            smi->ModulesCount = count;
+         }
+         else ret = STATUS_INFO_LENGTH_MISMATCH;
+ 
++        free( buffer );
+         break;
+     }
+ 
+@@ -3921,36 +3968,40 @@
+ 
+     case SystemModuleInformationEx:  /* 77 */
+     {
+-        /* FIXME: return some fake info for now */
+-        static const char *fake_modules[] =
+-        {
+-            "\\SystemRoot\\system32\\ntoskrnl.exe",
+-            "\\SystemRoot\\system32\\hal.dll",
+-            "\\SystemRoot\\system32\\drivers\\mountmgr.sys"
+-        };
+-
+-        ULONG i;
++        RTL_PROCESS_MODULES *modules = NULL, *resized;
+         RTL_PROCESS_MODULE_INFORMATION_EX *module_info = info;
+-
+-        len = sizeof(*module_info) * ARRAY_SIZE(fake_modules) + sizeof(module_info->NextOffset);
+-        if (len <= size)
+-        {
+-            memset( info, 0, len );
+-            for (i = 0; i < ARRAY_SIZE(fake_modules); i++)
++        ULONG module_size = 0, i, attempt;
++
++        for (attempt = 0; attempt < 4; ++attempt)
++        {
++            ret = NtQuerySystemInformation( SystemModuleInformation, NULL, 0, &module_size );
++            if (ret != STATUS_INFO_LENGTH_MISMATCH) break;
++            if (!(resized = realloc( modules, module_size )))
+             {
+-                RTL_PROCESS_MODULE_INFORMATION *sm = &module_info[i].BaseInfo;
+-                sm->ImageBaseAddress = (char *)0x10000000 + 0x200000 * i;
+-                sm->ImageSize = 0x200000;
+-                sm->LoadOrderIndex = i;
+-                sm->LoadCount = 1;
+-                strcpy( (char *)sm->Name, fake_modules[i] );
+-                sm->NameOffset = strrchr( fake_modules[i], '\\' ) - fake_modules[i] + 1;
+-                module_info[i].NextOffset = sizeof(*module_info);
++                ret = STATUS_NO_MEMORY;
++                break;
+             }
+-            module_info[ARRAY_SIZE(fake_modules)].NextOffset = 0;
+-        }
+-        else ret = STATUS_INFO_LENGTH_MISMATCH;
+-
++            modules = resized;
++            ret = NtQuerySystemInformation( SystemModuleInformation, modules, module_size, &module_size );
++            if (ret != STATUS_INFO_LENGTH_MISMATCH) break;
++        }
++        if (!ret)
++        {
++            len = sizeof(*module_info) * modules->ModulesCount + sizeof(module_info->NextOffset);
++            if (len > size) ret = STATUS_INFO_LENGTH_MISMATCH;
++            else if (!info) ret = STATUS_ACCESS_VIOLATION;
++            else
++            {
++                memset( info, 0, len );
++                for (i = 0; i < modules->ModulesCount; ++i)
++                {
++                    module_info[i].BaseInfo = modules->Modules[i];
++                    module_info[i].NextOffset = sizeof(*module_info);
++                }
++                module_info[modules->ModulesCount].NextOffset = 0;
++            }
++        }
++        free( modules );
+         break;
+     }
+ 
+--- a/dlls/ntoskrnl.exe/instr.c
++++ b/dlls/ntoskrnl.exe/instr.c
+@@ -922,6 +922,16 @@
+     EXCEPTION_RECORD *record = ptrs->ExceptionRecord;
+     CONTEXT *context = ptrs->ContextRecord;
+ 
++    /* kernelmode rip */
++    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
++        (context->Rip & 0xffff800000000000ULL) == 0xffff800000000000ULL)
++    {
++        TRACE( "converting kernelmode rip=%Ix\n", context->Rip );
++        context->Rip &= 0x00007FFFFFFFFFFF;
++        TRACE( "resuming on rip=%Ix\n", context->Rip );
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++
+     if (record->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION ||
+         (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+          record->ExceptionInformation[0] == EXCEPTION_READ_FAULT))
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -389,6 +389,12 @@
+ 
+     if (type && ObGetObjectType( obj ) != type) return STATUS_OBJECT_TYPE_MISMATCH;
+ 
++    /* The virtual System process is backed by the driver host, but has its own
++     * kernel identity. It is not a user process registered with wineserver. */
++    if (obj == PsInitialSystemProcess)
++        return NtDuplicateObject(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
++                                 handle, access, attr & OBJ_KERNEL_HANDLE, 0);
++
+     SERVER_START_REQ( get_kernel_object_handle )
+     {
+         req->manager  = wine_server_obj_handle( get_device_manager() );
+@@ -745,7 +751,6 @@
+ 
+     TRACE( "ioctl %x device %p file %p in_size %lu out_size %lu\n",
+            context->params.ioctl.code, device, file, context->in_size, out_size );
+-
+     if (out_size)
+     {
+         if ((context->params.ioctl.code & 3) != METHOD_BUFFERED)
+@@ -908,6 +913,7 @@
+     struct wine_driver *driver = WINE_RB_ENTRY_VALUE( entry, struct wine_driver, entry );
+     SERVICE_STATUS_HANDLE service_handle = driver->service_handle;
+     LDR_DATA_TABLE_ENTRY *ldr;
++    client_ptr_t base;
+ 
+     if (!service_handle) return;    /* not a service */
+ 
+@@ -920,6 +926,7 @@
+     }
+ 
+     ldr = driver->driver_obj.DriverSection;
++    base = wine_server_client_ptr( driver->driver_obj.DriverStart );
+ 
+     set_service_status( service_handle, SERVICE_STOP_PENDING, 0 );
+ 
+@@ -928,6 +935,13 @@
+     driver->driver_obj.DriverUnload( &driver->driver_obj );
+ 
+     TRACE_(relay)( "\1Ret  driver unload %p (obj=%p)\n", driver->driver_obj.DriverUnload, &driver->driver_obj );
++
++    SERVER_START_REQ( unregister_kernel_module )
++    {
++        req->base = base;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
+ 
+     FreeLibrary( ldr->DllBase );
+     IoDeleteDriver( &driver->driver_obj );
+@@ -950,7 +964,15 @@
+     HANDLE handles[2];
+ 
+     /* Set the system process global before setting up the request thread trickery  */
+-    PsInitialSystemProcess = IoGetCurrentProcess();
++    if (!(PsInitialSystemProcess = alloc_kernel_object(PsProcessType, NULL, sizeof(*PsInitialSystemProcess), 1)))
++        return STATUS_NO_MEMORY;
++    *PsInitialSystemProcess = *IoGetCurrentProcess();
++    PsInitialSystemProcess->info.UniqueProcessId = 4;
++    PsInitialSystemProcess->info.InheritedFromUniqueProcessId = 0;
++    PsInitialSystemProcess->info.PebBaseAddress = NULL;
++    PsInitialSystemProcess->session_id = 0;
++    PsInitialSystemProcess->wow64 = FALSE;
++    strcpy(PsInitialSystemProcess->image_name, "System");
+     request_thread = GetCurrentThreadId();
+ 
+     pnp_manager_start();
+@@ -1233,6 +1255,99 @@
+ }
+ 
+ 
++/* Keep section views available until the last locked MDL releases them.
++ * Allocation-wide tracking and failure handling adapted from
++ * kanata-dp/nikke-crossover-compat, 8f3c77b131d0 (LGPL-2.1-or-later),
++ * extending the DW-Proton locked-MDL lifetime work credited in NOTICE.md. */
++struct mapped_view
++{
++    struct list entry;
++    MDL *mdl;
++    void *allocation_base;
++    void *pending_unmap;
++};
++
++static struct list mapped_views = LIST_INIT( mapped_views );
++DECLARE_CRITICAL_SECTION(mapped_views_cs);
++static struct mapped_view *find_mapped_view( const void *addr )
++{
++    struct mapped_view *view;
++    MEMORY_BASIC_INFORMATION info;
++
++    if (!VirtualQuery( addr, &info, sizeof(info) )) return NULL;
++    LIST_FOR_EACH_ENTRY( view, &mapped_views, struct mapped_view, entry )
++        if (info.AllocationBase == view->allocation_base)
++            return view;
++    return NULL;
++}
++
++static BOOL add_mapped_view( MDL *mdl )
++{
++    struct mapped_view *view;
++    MEMORY_BASIC_INFORMATION info;
++
++    if (!(mdl->MdlFlags & MDL_PAGES_LOCKED) ||
++        !VirtualQuery( mdl->MappedSystemVa, &info, sizeof(info) ) || info.Type != MEM_MAPPED) return TRUE;
++    if (!(view = malloc( sizeof(*view) ))) return FALSE;
++    view->mdl = mdl;
++    view->allocation_base = info.AllocationBase;
++    view->pending_unmap = NULL;
++
++    EnterCriticalSection( &mapped_views_cs );
++    list_add_tail( &mapped_views, &view->entry );
++    LeaveCriticalSection( &mapped_views_cs );
++    return TRUE;
++}
++
++static void remove_mapped_view( MDL *mdl )
++{
++    struct mapped_view *view, *other;
++    void *unmap = NULL;
++
++    EnterCriticalSection( &mapped_views_cs );
++    LIST_FOR_EACH_ENTRY( view, &mapped_views, struct mapped_view, entry )
++    {
++        if (view->mdl != mdl) continue;
++        unmap = view->pending_unmap;
++        list_remove( &view->entry );
++        free( view );
++        /* another MDL may still map the same view */
++        if (unmap && (other = find_mapped_view( unmap )))
++        {
++            other->pending_unmap = unmap;
++            unmap = NULL;
++        }
++        break;
++    }
++    LeaveCriticalSection( &mapped_views_cs );
++
++    if (unmap) NtUnmapViewOfSection( GetCurrentProcess(), unmap );
++}
++
++/***********************************************************************
++ *           ZwUnmapViewOfSection  (NTOSKRNL.EXE.@)
++ */
++NTSTATUS WINAPI ZwUnmapViewOfSection( HANDLE process, void *addr )
++{
++    struct mapped_view *view = NULL;
++
++    TRACE( "process %p, addr %p\n", process, addr );
++
++    if (process == GetCurrentProcess())
++    {
++        EnterCriticalSection( &mapped_views_cs );
++        if ((view = find_mapped_view( addr ))) view->pending_unmap = addr;
++        LeaveCriticalSection( &mapped_views_cs );
++    }
++    if (view)
++    {
++        TRACE( "deferring unmap %p while MDL remains mapped\n", addr );
++        return STATUS_SUCCESS;
++    }
++
++    return NtUnmapViewOfSection( process, addr );
++}
++
+ /***********************************************************************
+  *           IoAllocateMdl  (NTOSKRNL.EXE.@)
+  */
+@@ -1276,6 +1391,7 @@
+ void WINAPI IoFreeMdl(PMDL mdl)
+ {
+     TRACE("%p\n", mdl);
++    remove_mapped_view( mdl );
+     HeapFree(GetProcessHeap(), 0, mdl);
+ }
+ 
+@@ -1548,6 +1664,7 @@
+     struct wine_driver *driver = obj;
+     RtlFreeUnicodeString( &driver->driver_obj.DriverName );
+     RtlFreeUnicodeString( &driver->driver_obj.DriverExtension->ServiceKeyName );
++    RtlFreeUnicodeString( &driver->registry_path );
+     free_kernel_object( driver );
+ }
+ 
+@@ -1569,6 +1686,7 @@
+ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
+ {
+     struct wine_driver *driver;
++    const WCHAR *key_name;
+     NTSTATUS status;
+     unsigned int i;
+ 
+@@ -1587,7 +1705,10 @@
+     driver->driver_obj.DriverInit      = init;
+     driver->driver_obj.DriverExtension = &driver->driver_extension;
+     driver->driver_extension.DriverObject   = &driver->driver_obj;
+-    build_driver_keypath( driver->driver_obj.DriverName.Buffer, &driver->driver_extension.ServiceKeyName );
++    build_driver_keypath( driver->driver_obj.DriverName.Buffer, &driver->registry_path );
++    if ((key_name = wcsrchr( driver->registry_path.Buffer, '\\' ))) key_name++;
++    else key_name = driver->registry_path.Buffer;
++    RtlCreateUnicodeString( &driver->driver_extension.ServiceKeyName, key_name );
+     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+         driver->driver_obj.MajorFunction[i] = unhandled_irp;
+     list_init( &driver->root_pnp_devices );
+@@ -1597,7 +1718,7 @@
+         ERR( "failed to insert driver %s in tree\n", debugstr_us(name) );
+     LeaveCriticalSection( &drivers_cs );
+ 
+-    status = driver->driver_obj.DriverInit( &driver->driver_obj, &driver->driver_extension.ServiceKeyName );
++    status = driver->driver_obj.DriverInit( &driver->driver_obj, &driver->registry_path );
+     if (status)
+     {
+         IoDeleteDriver( &driver->driver_obj );
+@@ -2584,6 +2705,13 @@
+ 
+     TRACE( "(%p %p)\n", processid, process );
+ 
++    if (processid == (HANDLE)4 && PsInitialSystemProcess)
++    {
++        ObReferenceObject(PsInitialSystemProcess);
++        *process = PsInitialSystemProcess;
++        return STATUS_SUCCESS;
++    }
++
+     if (!(handle = OpenProcess( PROCESS_ALL_ACCESS, FALSE, HandleToUlong(processid) )))
+         return STATUS_INVALID_PARAMETER;
+ 
+@@ -2600,6 +2728,26 @@
+ {
+     TRACE( "%p -> %Ix\n", process, process->info.UniqueProcessId );
+     return (HANDLE)process->info.UniqueProcessId;
++}
++
++/*********************************************************************
++ *           PsGetProcessExitStatus    (NTOSKRNL.@)
++ */
++NTSTATUS WINAPI PsGetProcessExitStatus( PEPROCESS process )
++{
++    PROCESS_BASIC_INFORMATION info;
++    NTSTATUS status;
++    HANDLE handle;
++
++    if ((status = ObOpenObjectByPointer( process, 0, NULL, PROCESS_QUERY_LIMITED_INFORMATION,
++                                        PsProcessType, KernelMode, &handle )))
++        return status;
++    status = NtQueryInformationProcess( handle, ProcessBasicInformation, &info, sizeof(info), NULL );
++    NtClose( handle );
++    if (status) return status;
++    process->info.ExitStatus = info.ExitStatus;
++    TRACE( "%p -> %#lx\n", process, info.ExitStatus );
++    return info.ExitStatus;
+ }
+ 
+ /*********************************************************************
+@@ -2754,7 +2902,7 @@
+ /*********************************************************************
+  *           PsGetContextThread    (NTOSKRNL.@)
+  */
+-NTSTATUS WINAPI PsGetContextThread(PETHREAD thread, CONTEXT *context, KPROCESSOR_MODE mode)
++NTSTATUS WINAPI get_context_thread(PETHREAD thread, CONTEXT *context, KPROCESSOR_MODE mode)
+ {
+     NTSTATUS status;
+     HANDLE h;
+@@ -2775,6 +2923,23 @@
+ 
+     return status;
+ }
++
++#ifdef __x86_64__
++__ASM_GLOBAL_FUNC( PsGetContextThread,
++                   "subq $0x28,%rsp\n\t"
++                   __ASM_SEH(".seh_stackalloc 0x28\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
++                   __ASM_CFI(".cfi_adjust_cfa_offset 0x28\n\t")
++                   "call " __ASM_NAME("get_context_thread") "\n\t"
++                   "addq $0x28,%rsp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset -0x28\n\t")
++                   "ret" )
++#else
++NTSTATUS WINAPI PsGetContextThread(PETHREAD thread, CONTEXT *context, KPROCESSOR_MODE mode)
++{
++    return get_context_thread(thread, context, mode);
++}
++#endif
+ 
+ /***********************************************************************
+  *           KeInsertQueue   (NTOSKRNL.EXE.@)
+@@ -3107,6 +3272,41 @@
+ }
+ 
+ /***********************************************************************
++ *           MmCopyMemory   (NTOSKRNL.EXE.@)
++ */
++NTSTATUS WINAPI MmCopyMemory(void *target, MM_COPY_ADDRESS source, SIZE_T size, ULONG flags, SIZE_T *copied)
++{
++    const char *src = source.VirtualAddress;
++    char *dst = target;
++    NTSTATUS status;
++
++    TRACE("target %p, source %s, size %Iu, flags %#lx, copied %p\n",
++          target, wine_dbgstr_longlong(source.PhysicalAddress.QuadPart), size, flags, copied);
++
++    if (!copied) return STATUS_INVALID_PARAMETER;
++    *copied = 0;
++    if (flags != MM_COPY_MEMORY_VIRTUAL && flags != MM_COPY_MEMORY_PHYSICAL)
++        return STATUS_INVALID_PARAMETER;
++    /* Wine has no access to the host's physical RAM. Never substitute a virtual
++     * address or report an unread physical range as successfully copied. */
++    if (flags == MM_COPY_MEMORY_PHYSICAL) return STATUS_NOT_SUPPORTED;
++    if ((ULONG_PTR)src + size < (ULONG_PTR)src || (ULONG_PTR)dst + size < (ULONG_PTR)dst)
++        return STATUS_INVALID_PARAMETER;
++
++    while (*copied < size)
++    {
++        SIZE_T chunk = min(size - *copied, PAGE_SIZE - BYTE_OFFSET(src)), read = 0;
++
++        status = NtReadVirtualMemory(NtCurrentProcess(), src, dst, chunk, &read);
++        *copied += read;
++        if (status || read != chunk) return *copied || !status ? STATUS_PARTIAL_COPY : status;
++        src += read;
++        dst += read;
++    }
++    return STATUS_SUCCESS;
++}
++
++/***********************************************************************
+  *           MmGetPhysicalAddress   (NTOSKRNL.EXE.@)
+  */
+ PHYSICAL_ADDRESS WINAPI MmGetPhysicalAddress(void *virtual_address)
+@@ -3180,8 +3380,11 @@
+ {
+     TRACE( "%p %u\n", mdl, mode );
+ 
++    if (mdl->MdlFlags & MDL_MAPPED_TO_SYSTEM_VA) return mdl->MappedSystemVa;
++
++    mdl->MappedSystemVa = (char *)mdl->StartVa + mdl->ByteOffset;
++    if (!add_mapped_view( mdl )) { mdl->MappedSystemVa = NULL; return NULL; }
+     mdl->MdlFlags |= MDL_MAPPED_TO_SYSTEM_VA;
+-    mdl->MappedSystemVa = (char *)mdl->StartVa + mdl->ByteOffset;
+     return mdl->MappedSystemVa;
+ }
+ 
+@@ -3194,7 +3397,7 @@
+     TRACE("(%p, %u, %u, %p, %lu, %u)\n", MemoryDescriptorList, AccessMode, CacheType,
+           BaseAddress, BugCheckOnFailure, Priority);
+ 
+-    if (BaseAddress) FIXME("requested base address %p ignored\n", BaseAddress);
++    if (BaseAddress) { WARN("fixed-address MDL mappings are unsupported\n"); return NULL; }
+ 
+     return MmMapLockedPages( MemoryDescriptorList, AccessMode );
+ }
+@@ -3206,7 +3409,9 @@
+ {
+     TRACE( "%p %p\n", base, mdl );
+ 
++    remove_mapped_view( mdl );
+     mdl->MdlFlags &= ~MDL_MAPPED_TO_SYSTEM_VA;
++    mdl->MappedSystemVa = NULL;
+ }
+ 
+ /***********************************************************************
+@@ -3254,6 +3459,8 @@
+ {
+     TRACE("(%p)\n", MemoryDescriptorList);
+ 
++    if (MemoryDescriptorList->MdlFlags & MDL_MAPPED_TO_SYSTEM_VA)
++        MmUnmapLockedPages( MemoryDescriptorList->MappedSystemVa, MemoryDescriptorList );
+     MemoryDescriptorList->MdlFlags &= ~MDL_PAGES_LOCKED;
+ }
+ 
+@@ -3379,12 +3586,89 @@
+ /***********************************************************************
+  *           ObRegisterCallbacks (NTOSKRNL.EXE.@)
+  */
++struct object_callback_operation
++{
++    POBJECT_TYPE type;
++    OB_OPERATION operations;
++    POB_PRE_OPERATION_CALLBACK pre;
++    POB_POST_OPERATION_CALLBACK post;
++};
++
++struct object_callback_registration
++{
++    struct list entry;
++    void *context;
++    UNICODE_STRING altitude;
++    HANDLE idle;
++    ULONG active;
++    USHORT count;
++    struct object_callback_operation operation[1];
++};
++
++static struct list object_callbacks = LIST_INIT(object_callbacks);
++static CRITICAL_SECTION object_callbacks_cs;
++
+ NTSTATUS WINAPI ObRegisterCallbacks(POB_CALLBACK_REGISTRATION callback, void **handle)
+ {
+-    FIXME( "callback %p, handle %p.\n", callback, handle );
+-
+-    if(handle)
+-        *handle = UlongToHandle(0xdeadbeaf);
++    struct object_callback_registration *registration, *other;
++    SIZE_T size;
++    unsigned int i;
++
++    if (!callback || !handle || callback->Version != OB_FLT_REGISTRATION_VERSION ||
++        !callback->OperationRegistrationCount || !callback->OperationRegistration ||
++        !callback->Altitude.Buffer || !callback->Altitude.Length)
++        return STATUS_INVALID_PARAMETER;
++    *handle = NULL;
++    for (i = 0; i < callback->OperationRegistrationCount; ++i)
++    {
++        OB_OPERATION_REGISTRATION *op = callback->OperationRegistration + i;
++
++        if (!op->ObjectType || (*op->ObjectType != PsThreadType && *op->ObjectType != PsProcessType) ||
++            !op->Operations || (op->Operations & ~(OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE)) ||
++            (!op->PreOperation && !op->PostOperation)) return STATUS_INVALID_PARAMETER;
++    }
++    size = sizeof(*registration) + (callback->OperationRegistrationCount - 1) * sizeof(registration->operation[0]);
++    if (!(registration = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size))) return STATUS_INSUFFICIENT_RESOURCES;
++    if (!(registration->altitude.Buffer = HeapAlloc(GetProcessHeap(), 0, callback->Altitude.Length)))
++    {
++        HeapFree(GetProcessHeap(), 0, registration);
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++    memcpy(registration->altitude.Buffer, callback->Altitude.Buffer, callback->Altitude.Length);
++    registration->altitude.Length = registration->altitude.MaximumLength = callback->Altitude.Length;
++    registration->idle = CreateEventW(NULL, TRUE, TRUE, NULL);
++    if (!registration->idle)
++    {
++        HeapFree(GetProcessHeap(), 0, registration->altitude.Buffer);
++        HeapFree(GetProcessHeap(), 0, registration);
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++    registration->count = callback->OperationRegistrationCount;
++    registration->context = callback->RegistrationContext;
++    for (i = 0; i < registration->count; ++i)
++    {
++        OB_OPERATION_REGISTRATION *op = callback->OperationRegistration + i;
++        registration->operation[i].type = *op->ObjectType;
++        registration->operation[i].operations = op->Operations;
++        registration->operation[i].pre = op->PreOperation;
++        registration->operation[i].post = op->PostOperation;
++        TRACE("callback %u type=%p pre=%p post=%p\n", i, *op->ObjectType, op->PreOperation, op->PostOperation);
++    }
++    EnterCriticalSection(&object_callbacks_cs);
++    LIST_FOR_EACH_ENTRY(other, &object_callbacks, struct object_callback_registration, entry)
++    {
++        if (!RtlCompareUnicodeString(&other->altitude, &registration->altitude, FALSE))
++        {
++            LeaveCriticalSection(&object_callbacks_cs);
++            CloseHandle(registration->idle);
++            HeapFree(GetProcessHeap(), 0, registration->altitude.Buffer);
++            HeapFree(GetProcessHeap(), 0, registration);
++            return STATUS_FLT_INSTANCE_ALTITUDE_COLLISION;
++        }
++    }
++    list_add_tail(&object_callbacks, &registration->entry);
++    LeaveCriticalSection(&object_callbacks_cs);
++    *handle = registration;
+ 
+     return STATUS_SUCCESS;
+ }
+@@ -3394,7 +3678,142 @@
+  */
+ void WINAPI ObUnRegisterCallbacks(void *handle)
+ {
+-    FIXME( "stub: %p\n", handle );
++    struct object_callback_registration *registration;
++    BOOL found = FALSE;
++
++    EnterCriticalSection(&object_callbacks_cs);
++    LIST_FOR_EACH_ENTRY(registration, &object_callbacks, struct object_callback_registration, entry)
++    {
++        if (registration != handle) continue;
++        list_remove(&registration->entry);
++        found = TRUE;
++        break;
++    }
++    LeaveCriticalSection(&object_callbacks_cs);
++    if (!found) return;
++    WaitForSingleObject(registration->idle, INFINITE);
++    CloseHandle(registration->idle);
++    HeapFree(GetProcessHeap(), 0, registration->altitude.Buffer);
++    HeapFree(GetProcessHeap(), 0, registration);
++}
++
++struct object_callback_call
++{
++    struct object_callback_registration *registration;
++    struct object_callback_operation operation;
++    void *context;
++};
++
++static NTSTATUS open_object_with_callbacks(HANDLE *handle, ACCESS_MASK access,
++                                           const OBJECT_ATTRIBUTES *attributes, const CLIENT_ID *client, BOOL thread)
++{
++    struct object_callback_registration *registration;
++    struct object_callback_call *calls = NULL;
++    POBJECT_TYPE type = thread ? PsThreadType : PsProcessType;
++    OB_PRE_OPERATION_PARAMETERS parameters;
++    OB_POST_OPERATION_PARAMETERS post_parameters;
++    OB_PRE_OPERATION_INFORMATION pre;
++    OB_POST_OPERATION_INFORMATION post;
++    OBJECT_BASIC_INFORMATION basic;
++    CLIENT_ID native_client;
++    NTSTATUS status;
++    void *object;
++    unsigned int count = 0, i, j;
++
++    if (!client || (thread ? !client->UniqueThread : !client->UniqueProcess))
++        return thread ? NtOpenThread(handle, access, attributes, client) : NtOpenProcess(handle, access, attributes, client);
++    status = thread ? PsLookupThreadByThreadId(client->UniqueThread, (PETHREAD *)&object) :
++                      PsLookupProcessByProcessId(client->UniqueProcess, (PEPROCESS *)&object);
++    if (status) return status;
++
++    EnterCriticalSection(&object_callbacks_cs);
++    LIST_FOR_EACH_ENTRY(registration, &object_callbacks, struct object_callback_registration, entry)
++        for (i = 0; i < registration->count; ++i)
++            if (registration->operation[i].type == type &&
++                (registration->operation[i].operations & OB_OPERATION_HANDLE_CREATE)) ++count;
++    if (count && !(calls = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, count * sizeof(*calls))))
++    {
++        LeaveCriticalSection(&object_callbacks_cs);
++        ObDereferenceObject(object);
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++    j = 0;
++    LIST_FOR_EACH_ENTRY(registration, &object_callbacks, struct object_callback_registration, entry)
++    {
++        for (i = 0; i < registration->count; ++i)
++        {
++            struct object_callback_operation *op = registration->operation + i;
++
++            if (op->type != type || !(op->operations & OB_OPERATION_HANDLE_CREATE)) continue;
++            if (!registration->active++) ResetEvent(registration->idle);
++            calls[j].registration = registration;
++            calls[j++].operation = *op;
++        }
++    }
++    LeaveCriticalSection(&object_callbacks_cs);
++
++    memset(&pre, 0, sizeof(pre));
++    memset(&parameters, 0, sizeof(parameters));
++    pre.Operation = OB_OPERATION_HANDLE_CREATE;
++    pre.KernelHandle = attributes && (attributes->Attributes & OBJ_KERNEL_HANDLE);
++    pre.Object = object;
++    pre.ObjectType = type;
++    pre.Parameters = &parameters;
++    parameters.CreateHandleInformation.DesiredAccess = access;
++    parameters.CreateHandleInformation.OriginalDesiredAccess = access;
++    for (i = 0; i < count; ++i)
++    {
++        pre.CallContext = NULL;
++        if (calls[i].operation.pre)
++        {
++            TRACE("calling object pre %p object=%p type=%p\n", calls[i].operation.pre, object, type);
++            calls[i].operation.pre(calls[i].registration->context, &pre);
++        }
++        calls[i].context = pre.CallContext;
++        parameters.CreateHandleInformation.DesiredAccess &= access;
++    }
++    access = parameters.CreateHandleInformation.DesiredAccess;
++    native_client = *client;
++    if (!thread && object == PsInitialSystemProcess)
++        native_client.UniqueProcess = ULongToHandle(GetCurrentProcessId());
++    status = thread ? NtOpenThread(handle, access, attributes, &native_client) : NtOpenProcess(handle, access, attributes, &native_client);
++
++    memset(&post, 0, sizeof(post));
++    memset(&post_parameters, 0, sizeof(post_parameters));
++    post.Operation = OB_OPERATION_HANDLE_CREATE;
++    post.KernelHandle = pre.KernelHandle;
++    post.Object = object;
++    post.ObjectType = type;
++    post.ReturnStatus = status;
++    post.Parameters = &post_parameters;
++    if (!status && !NtQueryObject(*handle, ObjectBasicInformation, &basic, sizeof(basic), NULL))
++        post_parameters.CreateHandleInformation.GrantedAccess = basic.GrantedAccess;
++    for (i = count; i > 0; --i)
++    {
++        struct object_callback_call *call = calls + i - 1;
++
++        post.CallContext = call->context;
++        if (call->operation.post)
++        {
++            call->operation.post(call->registration->context, &post);
++        }
++        EnterCriticalSection(&object_callbacks_cs);
++        if (!--call->registration->active) SetEvent(call->registration->idle);
++        LeaveCriticalSection(&object_callbacks_cs);
++    }
++    HeapFree(GetProcessHeap(), 0, calls);
++    ObDereferenceObject(object);
++    return status;
++}
++
++NTSTATUS WINAPI ZwOpenThread(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attributes, const CLIENT_ID *client)
++{
++    return open_object_with_callbacks(handle, access, attributes, client, TRUE);
++}
++
++NTSTATUS WINAPI ZwOpenProcess(HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attributes, const CLIENT_ID *client)
++{
++    return open_object_with_callbacks(handle, access, attributes, client, FALSE);
+ }
+ 
+ /***********************************************************************
+@@ -3421,15 +3840,102 @@
+ /***********************************************************************
+  *           PsCreateSystemThread   (NTOSKRNL.EXE.@)
+  */
++struct system_thread_start
++{
++    PKSTART_ROUTINE routine;
++    void *context;
++    BOOL system_process;
++};
++
++#if defined(__x86_64__) && !defined(__arm64ec__)
++static void __attribute__((naked)) call_system_thread_start(void *context, PKSTART_ROUTINE routine)
++{
++    asm("movq $0xFFFF800000000000,%r8\n\t"
++        "orq %r8,(%rsp)\n\t"
++        "jmpq *%rdx\n\t");
++}
++#else
++static void call_system_thread_start(void *context, PKSTART_ROUTINE routine)
++{
++    routine(context);
++}
++#endif
++
++static void WINAPI start_system_thread(void *param)
++{
++    struct system_thread_start start = *(struct system_thread_start *)param;
++
++    HeapFree(GetProcessHeap(), 0, param);
++    if (start.system_process)
++    {
++        PRKTHREAD thread = KeGetCurrentThread();
++        thread->process = PsInitialSystemProcess;
++        thread->id.UniqueProcess = (HANDLE)PsInitialSystemProcess->info.UniqueProcessId;
++    }
++    KeEnterCriticalRegion();
++    call_system_thread_start(start.context, start.routine);
++    ExitThread(0);
++}
++
+ NTSTATUS WINAPI PsCreateSystemThread(PHANDLE ThreadHandle, ULONG DesiredAccess,
+ 				     POBJECT_ATTRIBUTES ObjectAttributes,
+ 			             HANDLE ProcessHandle, PCLIENT_ID ClientId,
+                                      PKSTART_ROUTINE StartRoutine, PVOID StartContext)
+ {
++    NTSTATUS status;
++    BOOL system_process = !ProcessHandle;
++
+     if (!ProcessHandle) ProcessHandle = GetCurrentProcess();
+-    return RtlCreateUserThread(ProcessHandle, 0, FALSE, 0, 0,
++    if (ProcessHandle == GetCurrentProcess())
++    {
++        struct system_thread_start *start = HeapAlloc(GetProcessHeap(), 0, sizeof(*start));
++
++        if (!start) return STATUS_NO_MEMORY;
++        start->routine = StartRoutine;
++        start->context = StartContext;
++        start->system_process = system_process;
++        status = RtlCreateUserThread(ProcessHandle, 0, FALSE, 0, 0, 0,
++                                     start_system_thread, start, ThreadHandle, ClientId);
++        if (status) HeapFree(GetProcessHeap(), 0, start);
++    }
++    else
++    status = RtlCreateUserThread(ProcessHandle, 0, FALSE, 0, 0,
+                                0, StartRoutine, StartContext,
+                                ThreadHandle, ClientId);
++    return status;
++}
++
++static void WINAPI run_ex_work_item(TP_CALLBACK_INSTANCE *instance, void *context)
++{
++    PWORK_QUEUE_ITEM item = context;
++    PWORKER_THREAD_ROUTINE routine = item->WorkerRoutine;
++    void *param = item->Parameter;
++    PRKTHREAD thread = KeGetCurrentThread();
++    PEPROCESS previous_process = thread->process;
++    HANDLE previous_id = thread->id.UniqueProcess;
++
++    thread->process = PsInitialSystemProcess;
++    thread->id.UniqueProcess = (HANDLE)PsInitialSystemProcess->info.UniqueProcessId;
++    TRACE("executing work item %p routine=%p parameter=%p\n", item, routine, param);
++    call_system_thread_start(param, routine);
++    thread->process = previous_process;
++    thread->id.UniqueProcess = previous_id;
++}
++
++static DWORD WINAPI run_ex_work_item_fallback(void *context)
++{
++    run_ex_work_item(NULL, context);
++    return 0;
++}
++
++void WINAPI ExQueueWorkItem(PWORK_QUEUE_ITEM item, WORK_QUEUE_TYPE type)
++{
++    HANDLE thread;
++
++    TRACE("work item=%p routine=%p parameter=%p type=%u\n", item, item->WorkerRoutine, item->Parameter, type);
++    if (TrySubmitThreadpoolCallback(run_ex_work_item, item, NULL)) return;
++    if ((thread = CreateThread(NULL, 0, run_ex_work_item_fallback, item, 0, NULL))) CloseHandle(thread);
++    else ERR("failed to queue work item %p, error %lu\n", item, GetLastError());
+ }
+ 
+ /***********************************************************************
+@@ -4372,6 +4878,15 @@
+     return module;
+ }
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++static NTSTATUS __attribute__((naked)) call_driver_init( struct _DRIVER_OBJECT *driver, PUNICODE_STRING keyname, void *init )
++{
++    asm( "movq $0xFFFF800000000000,%r9\n\t"
++         "orq %r9,(%rsp)\n\t" 
++         "jmpq *%r8\n\t" );
++}
++#endif
++
+ /* call the driver init entry point */
+ static NTSTATUS WINAPI init_driver( DRIVER_OBJECT *driver_object, UNICODE_STRING *keyname )
+ {
+@@ -4393,6 +4908,16 @@
+     driver_object->DriverStart = ((LDR_DATA_TABLE_ENTRY *)driver_object->DriverSection)->DllBase;
+     driver_object->DriverSize = ((LDR_DATA_TABLE_ENTRY *)driver_object->DriverSection)->SizeOfImage;
+ 
++    SERVER_START_REQ( register_kernel_module )
++    {
++        req->base = wine_server_client_ptr( driver_object->DriverStart );
++        req->size = driver_object->DriverSize;
++        LDR_DATA_TABLE_ENTRY *ldr = driver_object->DriverSection;
++        wine_server_add_data( req, ldr->FullDllName.Buffer, ldr->FullDllName.Length );
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
+     nt = RtlImageNtHeader( module );
+     if (!nt->OptionalHeader.AddressOfEntryPoint) return STATUS_SUCCESS;
+     driver_object->DriverInit = (PDRIVER_INITIALIZE)((char *)module + nt->OptionalHeader.AddressOfEntryPoint);
+@@ -4400,7 +4925,11 @@
+     TRACE_(relay)( "\1Call driver init %p (obj=%p,str=%s)\n",
+                    driver_object->DriverInit, driver_object, wine_dbgstr_w(keyname->Buffer) );
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    status = call_driver_init( driver_object, keyname, driver_object->DriverInit );
++#else
+     status = driver_object->DriverInit( driver_object, keyname );
++#endif
+ 
+     TRACE_(relay)( "\1Ret  driver init %p (obj=%p,str=%s) retval=%08lx\n",
+                    driver_object->DriverInit, driver_object, wine_dbgstr_w(keyname->Buffer), status );
+@@ -5099,6 +5628,7 @@
+     switch(reason)
+     {
+     case DLL_PROCESS_ATTACH:
++        InitializeCriticalSection(&object_callbacks_cs);
+         DisableThreadLibraryCalls( inst );
+ #if defined(__i386__) || defined(__x86_64__)
+         handler = RtlAddVectoredExceptionHandler( TRUE, vectored_handler );
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -184,7 +184,7 @@
+ @ stdcall ExLocalTimeToSystemTime(ptr ptr) RtlLocalTimeToSystemTime
+ @ stdcall ExNotifyCallback(ptr ptr ptr)
+ @ stub ExQueryPoolBlockSize
+-@ stub ExQueueWorkItem
++@ stdcall ExQueueWorkItem(ptr long)
+ @ stub ExRaiseAccessViolation
+ @ stub ExRaiseDatatypeMisalignment
+ @ stub ExRaiseException
+@@ -718,6 +718,7 @@
+ @ stub MmCanFileBeTruncated
+ @ stub MmCommitSessionMappedView
+ @ stdcall MmCopyVirtualMemory(ptr ptr ptr ptr long long ptr)
++@ stdcall MmCopyMemory(ptr int64 long long ptr)
+ @ stub MmCreateMdl
+ @ stdcall MmCreateSection(ptr long ptr ptr long long long ptr)
+ @ stub MmDisableModifiedWriteOfSection
+@@ -926,7 +927,7 @@
+ @ stdcall PsGetProcessCreateTimeQuadPart(ptr)
+ @ stub PsGetProcessDebugPort
+ @ stub PsGetProcessExitProcessCalled
+-@ stub PsGetProcessExitStatus
++@ stdcall PsGetProcessExitStatus(ptr)
+ @ stub PsGetProcessExitTime
+ @ stdcall PsGetProcessId(ptr)
+ @ stdcall PsGetProcessImageFileName(ptr)
+@@ -1469,12 +1470,12 @@
+ @ stdcall -private ZwOpenKeyEx(ptr long ptr long) NtOpenKeyEx
+ @ stdcall -private ZwOpenKeyTransacted(ptr long ptr long) NtOpenKeyTransacted
+ @ stdcall -private ZwOpenKeyTransactedEx(ptr long ptr long long) NtOpenKeyTransactedEx
+-@ stdcall -private ZwOpenProcess(ptr long ptr ptr) NtOpenProcess
++@ stdcall -private ZwOpenProcess(ptr long ptr ptr)
+ @ stdcall -private ZwOpenProcessToken(long long ptr) NtOpenProcessToken
+ @ stdcall -private ZwOpenProcessTokenEx(long long long ptr) NtOpenProcessTokenEx
+ @ stdcall ZwOpenSection(ptr long ptr) NtOpenSection
+ @ stdcall -private ZwOpenSymbolicLinkObject(ptr long ptr) NtOpenSymbolicLinkObject
+-@ stdcall -private ZwOpenThread(ptr long ptr ptr) NtOpenThread
++@ stdcall -private ZwOpenThread(ptr long ptr ptr)
+ @ stdcall -private ZwOpenThreadToken(long long long ptr) NtOpenThreadToken
+ @ stdcall -private ZwOpenThreadTokenEx(long long long long ptr) NtOpenThreadTokenEx
+ @ stdcall -private ZwOpenTimer(ptr long ptr) NtOpenTimer
+@@ -1551,7 +1552,7 @@
+ @ stdcall -private ZwUnloadKey(ptr) NtUnloadKey
+ @ stdcall -private ZwUnlockFile(long ptr ptr ptr ptr) NtUnlockFile
+ @ stdcall -private ZwUnlockVirtualMemory(long ptr ptr long) NtUnlockVirtualMemory
+-@ stdcall ZwUnmapViewOfSection(long ptr) NtUnmapViewOfSection
++@ stdcall ZwUnmapViewOfSection(long ptr)
+ @ stdcall -private ZwWaitForMultipleObjects(long ptr long long ptr) NtWaitForMultipleObjects
+ @ stdcall ZwWaitForSingleObject(long long ptr) NtWaitForSingleObject
+ @ stdcall ZwWriteFile(long long ptr ptr ptr ptr long ptr ptr) NtWriteFile
+--- a/dlls/ntoskrnl.exe/ntoskrnl_private.h
++++ b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+@@ -86,6 +86,7 @@
+ extern POBJECT_TYPE IoFileObjectType;
+ extern POBJECT_TYPE PsProcessType;
+ extern POBJECT_TYPE PsThreadType;
++extern PEPROCESS PsInitialSystemProcess;
+ extern POBJECT_TYPE SeTokenObjectType;
+ 
+ #define DECLARE_CRITICAL_SECTION(cs) \
+@@ -99,6 +100,7 @@
+ {
+     DRIVER_OBJECT driver_obj;
+     DRIVER_EXTENSION driver_extension;
++    UNICODE_STRING registry_path;
+     SERVICE_STATUS_HANDLE service_handle;
+     struct wine_rb_entry entry;
+     struct list root_pnp_devices;
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -490,6 +490,12 @@
+     }
+ 
+     pthread_mutex_unlock( &surfaces_lock );
++}
++
++/* External native renderers share GL/Vulkan's window-surface registration. */
++void client_surface_use( struct client_surface *surface, BOOL use )
++{
++    use_window_client_surface( surface, use );
+ }
+ 
+ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw )
+--- a/dlls/wined3d/directx.c
++++ b/dlls/wined3d/directx.c
+@@ -25,6 +25,7 @@
+ #include "wined3d_gl.h"
+ #include "winternl.h"
+ #include "wine/list.h"
++#include "d3d11.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+@@ -2789,12 +2790,24 @@
+         struct wined3d_device_parent *device_parent, struct wined3d_device **device)
+ {
+     struct wined3d_device *object;
++    uint32_t wined3d_flags = 0;
+     HRESULT hr;
+ 
+     TRACE("wined3d %p, adapter %p, device_type %#x, focus_window %p, flags %#x, "
+             "surface_alignment %u, feature_levels %p, feature_level_count %u, device_parent %p, device %p.\n",
+             wined3d, adapter, device_type, focus_window, flags, surface_alignment,
+             feature_levels, feature_level_count, device_parent, device);
++
++    /* Unity uses shared resources if D3D11_CREATE_DEVICE_VIDEO_SUPPORT succeeds,
++     * so allow failing for now */
++    if (wined3d_settings.no_create_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
++        wined3d_flags |= WINED3DCREATE_VIDEO_SUPPORT;
++
++    if (flags != (flags & ~wined3d_flags))
++    {
++        FIXME("Failing for device create flags 0x%x forced unsupported by WINE_D3D_CONFIG override.\n", wined3d_settings.no_create_flags);
++        return E_FAIL;
++    }
+ 
+     if (FAILED(hr = adapter->adapter_ops->adapter_create_device(wined3d, adapter,
+             device_type, focus_window, flags, surface_alignment,
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -224,6 +224,23 @@
+             swapchain, wine_dbgstr_rect(src_rect), wine_dbgstr_rect(dst_rect),
+             dst_window_override, swap_interval, flags);
+ 
++    /* Optional render-size evidence, without account or command-line data. */
++    {
++        static unsigned int last_width, last_height;
++        char metrics_path[2];
++        if (GetEnvironmentVariableA("NIKKE_METAL_METRICS_FILE", metrics_path, sizeof(metrics_path))
++                && (last_width != desc->backbuffer_width || last_height != desc->backbuffer_height))
++        {
++            RECT client;
++            GetClientRect(swapchain->win_handle, &client);
++            ERR("NIKKE_RENDER backbuffer=%ux%u client=%ldx%ld format=%u swap_interval=%u windowed=%u\n",
++                    desc->backbuffer_width, desc->backbuffer_height, client.right, client.bottom,
++                    desc->backbuffer_format, swap_interval, desc->windowed);
++            last_width = desc->backbuffer_width;
++            last_height = desc->backbuffer_height;
++        }
++    }
++
+     if (flags)
+         FIXME("Ignoring flags %#x.\n", flags);
+ 
+@@ -696,6 +713,12 @@
+     swapchain_gl_present,
+     swapchain_frontbuffer_updated,
+ };
++
++static BOOL nikke_vsync_enabled(void)
++{
++    char enabled[2];
++    return GetEnvironmentVariableA("NIKKE_VSYNC", enabled, ARRAY_SIZE(enabled)) == 1 && enabled[0] == '1';
++}
+ 
+ static bool wined3d_swapchain_vk_present_mode_supported(struct wined3d_swapchain_vk *swapchain_vk,
+         VkPresentModeKHR vk_present_mode)
+@@ -1000,7 +1023,8 @@
+     }
+ 
+     vk_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+-    if (!swapchain_vk->s.swap_interval)
++    /* Optional display pacing for applications that implement their own frame cap. */
++    if (!swapchain_vk->s.swap_interval && !nikke_vsync_enabled())
+     {
+         if (wined3d_swapchain_vk_present_mode_supported(swapchain_vk, VK_PRESENT_MODE_IMMEDIATE_KHR))
+             vk_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+--- a/dlls/wined3d/wined3d_main.c
++++ b/dlls/wined3d/wined3d_main.c
+@@ -347,6 +347,8 @@
+     {
+         if (!get_config_key_dword(hkey, appkey, env, "csmt", &wined3d_settings.cs_multithreaded))
+             ERR_(winediag)("Setting multithreaded command stream to %#x.\n", wined3d_settings.cs_multithreaded);
++        if (!get_config_key_dword(hkey, appkey, env, "no_create_flags", &wined3d_settings.no_create_flags))
++            ERR_(winediag)("Force D3D device creation without support for flags %#x.\n", wined3d_settings.no_create_flags);
+         if (!get_config_key_dword(hkey, appkey, env, "MaxVersionGL", &tmpvalue))
+         {
+             ERR_(winediag)("Setting maximum allowed wined3d GL version to %u.%u.\n",
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -473,6 +473,7 @@
+ {
+     unsigned int cs_multithreaded;
+     unsigned int max_gl_version;
++    unsigned int no_create_flags;
+     unsigned short pci_vendor_id;
+     unsigned short pci_device_id;
+     /* Memory tracking and object counting. */
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -28,6 +28,7 @@
+ 	cocoa_window.m \
+ 	display.c \
+ 	dllmain.c \
++	dxmt.c \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -22,8 +22,13 @@
+ 
+ #define GL_SILENCE_DEPRECATION
+ #import <Metal/Metal.h>
++#import <mach/mach_time.h>
++#import <mach/mach.h>
+ #import <QuartzCore/QuartzCore.h>
+ #include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #import "cocoa_window.h"
+ 
+@@ -226,6 +231,7 @@
+ @interface WineMetalView : WineBaseView
+ {
+     id<MTLDevice> _device;
++    CADisplayLink *_rateLink;
+ }
+ 
+     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+@@ -264,7 +270,9 @@
+     - (void) wine_setBackingSize:(const int*)newBackingSize;
+ 
+     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
+-    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId;
++    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame;
++    - (void) updateCALayerHostFrame:(CAContextID)contextId frame:(CGRect)frame;
++    - (void) setCALayerHostZPosition:(CAContextID)contextId zPosition:(double)zpos;
+     - (void) removeCALayerHostView:(CAContextID)contextId;
+ 
+ @end
+@@ -354,6 +362,43 @@
+ @end
+ 
+ 
++/* Close at most one Win32-pixel gap at a remote surface's outer edge. Changing the
++ * host's frame alone does not resize its CAContext contents: transform the original
++ * surface instead, keeping interior siblings and zero-area surfaces untouched. */
++static CGRect snap_host_frame_to_view_edges(CGRect frame, CGRect view)
++{
++    const CGFloat px = retina_on ? 0.5 : 1.0;
++    CGFloat min_x = CGRectGetMinX(view), min_y = CGRectGetMinY(view);
++    CGFloat max_x = CGRectGetMaxX(view), max_y = CGRectGetMaxY(view);
++
++    if (CGRectIsEmpty(frame) || CGRectIsEmpty(view)) return frame;
++    if (frame.origin.x > min_x && frame.origin.x - min_x <= px)
++    {
++        frame.size.width += frame.origin.x - min_x;
++        frame.origin.x = min_x;
++    }
++    if (frame.origin.y > min_y && frame.origin.y - min_y <= px)
++    {
++        frame.size.height += frame.origin.y - min_y;
++        frame.origin.y = min_y;
++    }
++    if (fabs(CGRectGetMaxX(frame) - max_x) <= px)
++        frame.size.width = max_x - frame.origin.x;
++    if (fabs(CGRectGetMaxY(frame) - max_y) <= px)
++        frame.size.height = max_y - frame.origin.y;
++    return frame;
++}
++
++static void set_host_surface_frame(CALayerHost *host, CGRect frame, CGRect view)
++{
++    CGRect snapped = snap_host_frame_to_view_edges(frame, view);
++    host.transform = CATransform3DIdentity;
++    host.bounds = CGRectMake(0, 0, frame.size.width, frame.size.height);
++    host.position = CGPointMake(CGRectGetMidX(snapped), CGRectGetMidY(snapped));
++    host.transform = CATransform3DMakeScale(snapped.size.width / frame.size.width,
++                                          snapped.size.height / frame.size.height, 1.0);
++}
++
+ @implementation WineContentView
+ 
+ @synthesize everHadGLContext = _everHadGLContext;
+@@ -580,7 +625,7 @@
+         return _metalView;
+     }
+ 
+-    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId
++    - (void) addCALayerHostViewWithContextId:(CAContextID)contextId frame:(CGRect)frame
+     {
+         if (!_caLayerHosts)
+             _caLayerHosts = [[NSMutableDictionary alloc] init];
+@@ -591,13 +636,74 @@
+         [host setContextId:contextId];
+         host.magnificationFilter = kCAFilterNearest;
+         host.contentsScale = retina_on ? 2.0 : 1.0;
+-        host.frame = self.layer.bounds;
+-        host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++        /* A host given a real child rect is positioned and clipped to it, so siblings on one
++         * window stop occluding one another. Three cases, not two: CGRectIsEmpty cannot tell "no
++         * rect supplied" from "really 0x0", and a 0x0 layer stretched over the content view with
++         * nothing drawn in it blacks out everything below -- a window with no area is hidden. */
++        if (CGRectIsNull(frame))
++        {
++            /* no child rect supplied at all -- the root-window case */
++            host.frame = self.layer.bounds;
++            host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++        }
++        else if (CGRectIsEmpty(frame))
++        {
++            host.frame = CGRectZero;
++            host.masksToBounds = YES;
++            host.hidden = YES;
++        }
++        else
++        {
++            set_host_surface_frame(host, frame, self.layer.bounds);
++            host.masksToBounds = YES;
++        }
+ 
+         [self.layer addSublayer:host];
+         [_caLayerHosts setObject:host forKey:@(contextId)];
+ 
+         [(WineWindow*)self.window windowDidDrawContent];
++    }
++
++    - (void) updateCALayerHostFrame:(CAContextID)contextId frame:(CGRect)frame
++    {
++        CALayerHost* host = [_caLayerHosts objectForKey:@(contextId)];
++        if (host && CGRectIsEmpty(frame) && !CGRectIsNull(frame))
++        {
++            /* Became 0x0 while hosted: left alone, the layer keeps its last size and still covers
++             * live content. Zeroing the frame as well as hiding is the net below's other half. */
++            [CATransaction begin];
++            [CATransaction setDisableActions:YES];
++            host.hidden = YES;
++            host.frame = CGRectZero;
++            [CATransaction commit];
++        }
++        else if (host && !CGRectIsEmpty(frame))
++        {
++            /* The layer sits in the owner's coordinate space and the child it mirrors can move
++             * or resize in the other process, so refresh rather than leave a stale frame.
++             * Visibility and geometry are independent state and are tested separately: a window
++             * that reports 0x0 and returns to its old size would stay hidden under one guard. */
++            [CATransaction begin];
++            [CATransaction setDisableActions:YES];
++            set_host_surface_frame(host, frame, self.layer.bounds);
++            if (host.hidden) host.hidden = NO;
++            [CATransaction commit];
++        }
++    }
++
++    /* Stack the hosted layers the way the windows they mirror stack: insertion order is not that
++     * order, since a client that recreates a swapchain on every resize puts the last-recreated
++     * layer on top of live content. zPosition is authoritative whenever a layer was added. */
++    - (void) setCALayerHostZPosition:(CAContextID)contextId zPosition:(double)zpos
++    {
++        CALayerHost* host = [_caLayerHosts objectForKey:@(contextId)];
++        if (host && host.zPosition != zpos)
++        {
++            [CATransaction begin];
++            [CATransaction setDisableActions:YES];
++            host.zPosition = zpos;
++            [CATransaction commit];
++        }
+     }
+ 
+     - (void) removeCALayerHostView:(CAContextID)contextId
+@@ -862,6 +968,76 @@
+ @end
+ 
+ 
++/* Opt-in diagnostics: only presentation timing and surface metadata are written.
++ * Use the drawable's actual presentation time, rather than CPU submit frequency. */
++static FILE *open_presentation_metrics(const char *path)
++{
++    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
++    FILE *file;
++    if (fd < 0 && errno == EEXIST)
++    {
++        char *unique;
++        if (asprintf(&unique, "%s.XXXXXX", path) < 0) return NULL;
++        fd = mkstemp(unique);
++        free(unique);
++        if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
++    }
++    if (fd < 0) return NULL;
++    if (!(file = fdopen(fd, "w"))) close(fd);
++    return file;
++}
++
++@interface WineMeasuredMetalLayer : CAMetalLayer
++@end
++@implementation WineMeasuredMetalLayer
++    - (id<CAMetalDrawable>) nextDrawable
++    {
++        double requested = CACurrentMediaTime();
++        id<CAMetalDrawable> drawable = [super nextDrawable];
++        double acquired = CACurrentMediaTime();
++        static FILE *metrics;
++        static dispatch_queue_t metrics_queue;
++        static dispatch_once_t once;
++        dispatch_once(&once, ^{
++            const char *path = getenv("NIKKE_METAL_METRICS_FILE");
++            if (path && *path && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"org.winehq.nikke.unityprobe"]
++                    && (metrics = open_presentation_metrics(path)))
++            {
++                metrics_queue = dispatch_queue_create("org.winehq.nikke.presentation-metrics", DISPATCH_QUEUE_SERIAL);
++                fprintf(metrics, "presented_s,width,height,layer_points_w,layer_points_h,scale,pixel_format,color_space,edr,acquired_s,target_s,requested_s\n");
++            }
++        });
++        if (drawable && metrics)
++        {
++            NSUInteger width = drawable.texture.width, height = drawable.texture.height;
++            NSUInteger format = drawable.texture.pixelFormat;
++            CGSize points = self.bounds.size;
++            double scale = self.contentsScale;
++            BOOL edr = self.wantsExtendedDynamicRangeContent;
++            NSString *space = self.colorspace ? [(NSString *)CGColorSpaceCopyName(self.colorspace) autorelease] : @"untagged";
++            [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
++                double presented_time = presented.presentedTime;
++                dispatch_async(metrics_queue, ^{
++                    static unsigned int frames;
++                    fprintf(metrics, "%.9f,%lu,%lu,%.3f,%.3f,%.1f,%lu,%s,%d,%.9f,%.9f,%.9f\n",
++                            presented_time, (unsigned long)width, (unsigned long)height,
++                            points.width, points.height, scale, (unsigned long)format,
++                            space ? space.UTF8String : "unnamed", edr, acquired, 0.0, requested);
++                    if (++frames % 60 == 0) fflush(metrics);
++                });
++            }];
++        }
++        return drawable;
++    }
++@end
++
++/* Ask ProMotion for a 60 Hz application cadence without changing global settings. */
++@interface WineFrameRateRequest : NSObject
++@end
++@implementation WineFrameRateRequest
++    - (void) displayTick:(CADisplayLink *)sender { }
++@end
++
+ @implementation WineMetalView
+ 
+     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device
+@@ -876,8 +1052,39 @@
+         return self;
+     }
+ 
++    - (void) viewWillMoveToWindow:(NSWindow *)window
++    {
++        if (_rateLink)
++        {
++            [_rateLink invalidate];
++            [_rateLink release];
++            _rateLink = nil;
++        }
++        [super viewWillMoveToWindow:window];
++    }
++
++    - (void) viewDidMoveToWindow
++    {
++        [super viewDidMoveToWindow];
++        if (@available(macOS 14.0, *))
++        {
++            const char *rate = getenv("NIKKE_DISPLAY_FPS");
++            if (self.window && !_rateLink && rate && !strcmp(rate, "60")
++                    && [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"org.winehq.nikke.unityprobe"])
++            {
++                WineFrameRateRequest *request = [[[WineFrameRateRequest alloc] init] autorelease];
++                _rateLink = [[self displayLinkWithTarget:request selector:@selector(displayTick:)] retain];
++                _rateLink.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60);
++                [_rateLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
++                if (getenv("NIKKE_METAL_METRICS_FILE")) fprintf(stderr, "NIKKE_DISPLAY_RATE requested=60 active=1\n");
++            }
++        }
++    }
++
+     - (void) dealloc
+     {
++        [_rateLink invalidate];
++        [_rateLink release];
+         [_device release];
+         [super dealloc];
+     }
+@@ -890,7 +1097,8 @@
+ 
+     - (CALayer*) makeBackingLayer
+     {
+-        CAMetalLayer *layer = [CAMetalLayer layer];
++        CAMetalLayer *layer = getenv("NIKKE_METAL_METRICS_FILE")
++                ? [WineMeasuredMetalLayer layer] : [CAMetalLayer layer];
+         layer.device = _device;
+         layer.framebufferOnly = YES;
+         layer.magnificationFilter = kCAFilterNearest;
+@@ -3146,6 +3354,11 @@
+                                            windowFrame:NSRectFromCGRect(cgrect_mac_from_win(frame))
+                                                   hwnd:hwnd
+                                                  queue:queue] retain];
++        if (getenv("NIKKE_WINDOW_DIAGNOSTICS"))
++            NSLog(@"NIKKE-WINDOW hwnd=%p window=%ld pid=%d bundle=%@ executable=%@",
++                  hwnd, (long)[window windowNumber], getpid(),
++                  [[NSRunningApplication currentApplication] bundleIdentifier],
++                  [[NSRunningApplication currentApplication] executableURL]);
+     });
+ 
+     return window;
+@@ -3739,24 +3952,26 @@
+ @interface CAContextSwapChain : NSObject <WineMetalSwapChain>
+ {
+     void* hwnd;
++    void* child_hwnd;
+     id<MTLDevice> device;
+     CAMetalLayer* offscreen_layer;
+     CAContext* remote_context;
+     CAContextID context_id;
+ }
+ 
+-- (instancetype) initWithHwnd:(void*)hwnd bounds:(CGRect)bounds;
++- (instancetype) initWithHwnd:(void*)hwnd child:(void*)child bounds:(CGRect)bounds;
+ 
+ @end
+ 
+ @implementation CAContextSwapChain
+ 
+-- (instancetype) initWithHwnd:(void*)newHwnd bounds:(CGRect)bounds
++- (instancetype) initWithHwnd:(void*)newHwnd child:(void*)newChild bounds:(CGRect)bounds
+ {
+     self = [super init];
+     if (!self) return nil;
+ 
+     hwnd = newHwnd;
++    child_hwnd = newChild;
+     if (!(device = macdrv_create_metal_device()))
+     {
+         [self release];
+@@ -3777,6 +3992,7 @@
+     offscreen_layer.magnificationFilter = kCAFilterNearest;
+     offscreen_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+     offscreen_layer.contentsScale = retina_on ? 2.0 : 1.0;
++    bounds.origin = CGPointZero;
+     [offscreen_layer setBounds:cgrect_mac_from_win(bounds)];
+     [offscreen_layer setAnchorPoint:CGPointMake(0, 0)];
+ 
+@@ -3795,7 +4011,7 @@
+         return nil;
+     }
+ 
+-    macdrv_create_remote_layer(hwnd, context_id);
++    macdrv_create_remote_layer(hwnd, child_hwnd, context_id);
+     return self;
+ }
+ 
+@@ -3828,9 +4044,9 @@
+     return [[MetalViewSwapChain alloc] initWithView:view];
+ }
+ 
+-id<WineMetalSwapChain> macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds)
+-{
+-    return [[CAContextSwapChain alloc] initWithHwnd:hwnd bounds:bounds];
++id<WineMetalSwapChain> macdrv_create_offscreen_swapchain(void* hwnd, void* child, CGRect bounds)
++{
++    return [[CAContextSwapChain alloc] initWithHwnd:hwnd child:child bounds:bounds];
+ }
+ 
+ CAMetalLayer *macdrv_swapchain_get_layer(id<WineMetalSwapChain> swapchain)
+@@ -3838,20 +4054,70 @@
+     return [swapchain layer];
+ }
+ 
++void macdrv_swapchain_set_size(id<WineMetalSwapChain> swapchain, int width, int height)
++{
++    if (![swapchain isKindOfClass:[CAContextSwapChain class]]) return;
++
++    OnMainThread(^{
++        CAMetalLayer *layer = [swapchain layer];
++        CGRect bounds = cgrect_mac_from_win(CGRectMake(0, 0, width, height));
++
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        layer.bounds = bounds;
++        [CATransaction commit];
++        if (getenv("NIKKE_WINDOW_DIAGNOSTICS"))
++            NSLog(@"NIKKE-METAL bounds=%@ drawable=%@", NSStringFromRect(NSRectFromCGRect(bounds)),
++                  NSStringFromSize(NSSizeFromCGSize(layer.drawableSize)));
++    });
++}
++
+ void macdrv_destroy_swapchain(id<WineMetalSwapChain> swapchain)
+ {
+     [swapchain release];
+ }
+ 
+-void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int context_id)
++void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int context_id,
++                                             CGRect frame, double zpos, int zpos_valid)
+ {
+ @autoreleasepool
+ {
+     OnMainThread(^{
+         NSView* content_view = [window contentView];
+ 
++        /* The frame arrives in Win32 raw pixels and CALayer.frame is in points -- window.c works
++         * in Win32 space and the Cocoa side converts. A null frame (no child rect) stays null: it
++         * selects the whole-view case below and must not go through the retina divide. */
+         if ([content_view isKindOfClass:[WineContentView class]])
+-            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id];
++        {
++            CGRect mac_frame = CGRectIsNull(frame) ? CGRectNull : cgrect_mac_from_win(frame);
++
++            [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id
++                                                                      frame:mac_frame];
++            if (zpos_valid)
++                [(WineContentView*)content_view setCALayerHostZPosition:context_id zPosition:zpos];
++        }
++    });
++}
++}
++
++void macdrv_window_update_ca_layer_host_frame(WineWindow *window, unsigned int context_id,
++                                              CGRect frame, double zpos, int zpos_valid)
++{
++@autoreleasepool
++{
++    OnMainThread(^{
++        NSView* content_view = [window contentView];
++
++        /* same Win32-pixels -> Cocoa-points conversion as the create path above */
++        if ([content_view isKindOfClass:[WineContentView class]])
++        {
++            CGRect mac_frame = CGRectIsNull(frame) ? CGRectNull : cgrect_mac_from_win(frame);
++
++            [(WineContentView*)content_view updateCALayerHostFrame:context_id frame:mac_frame];
++            if (zpos_valid)
++                [(WineContentView*)content_view setCALayerHostZPosition:context_id zPosition:zpos];
++        }
+     });
+ }
+ }
+--- /dev/null
++++ b/dlls/winemac.drv/dxmt.c
+@@ -0,0 +1,113 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * Bridge the legacy DXMT window interface to Wine client surfaces.
++ * No game executable or authentication behavior is changed.
++ */
++#if 0
++#pragma makedep unix
++#endif
++#include "config.h"
++#include <pthread.h>
++#include <stdlib.h>
++#include "macdrv.h"
++
++struct dxmt_window_data
++{
++    HWND hwnd;
++    WineWindow *window;
++    WineContentView *view;
++    WineContentView *client;
++};
++struct dxmt_surface
++{
++    struct dxmt_surface *next;
++    WineMetalView *view;
++    struct client_surface *surface;
++};
++static pthread_mutex_t dxmt_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct dxmt_surface *dxmt_surfaces;
++
++static struct dxmt_window_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct dxmt_window_data *ret = calloc(1, sizeof(*ret));
++    if (ret)
++    {
++        ret->hwnd = hwnd;
++        /* The opaque client token is private to this exported function table. */
++        ret->client = (WineContentView *)ret;
++    }
++    return ret;
++}
++static void dxmt_release_win_data(struct dxmt_window_data *data)
++{
++    free(data);
++}
++static WineMetalView *dxmt_create_metal_view(WineContentView *token, id_MTLDevice device)
++{
++    struct dxmt_window_data *data = (struct dxmt_window_data *)token;
++    struct macdrv_client_surface *surface;
++    struct client_surface *client;
++    struct dxmt_surface *record;
++    WineMetalView *view;
++    if (!data || !NtUserIsWindow(data->hwnd)) return NULL;
++    if (!(record = calloc(1, sizeof(*record)))) return NULL;
++    if (!(client = macdrv_CreateClientSurface(data->hwnd, 0, FALSE)))
++    {
++        free(record);
++        return NULL;
++    }
++    surface = impl_from_client_surface(client);
++    if (!(view = macdrv_view_create_metal_view(surface->cocoa_view, device)))
++    {
++        client_surface_release(&surface->client);
++        free(record);
++        return NULL;
++    }
++    client_surface_use(&surface->client, TRUE);
++    client_surface_present(&surface->client);
++    record->surface = &surface->client;
++    record->view = view;
++    pthread_mutex_lock(&dxmt_mutex);
++    record->next = dxmt_surfaces;
++    dxmt_surfaces = record;
++    pthread_mutex_unlock(&dxmt_mutex);
++    return view;
++}
++static void dxmt_release_metal_view(WineMetalView *view)
++{
++    struct dxmt_surface **entry, *record = NULL;
++    pthread_mutex_lock(&dxmt_mutex);
++    for (entry = &dxmt_surfaces; *entry; entry = &(*entry)->next)
++        if ((*entry)->view == view)
++        {
++            record = *entry;
++            *entry = record->next;
++            break;
++        }
++    pthread_mutex_unlock(&dxmt_mutex);
++    macdrv_view_release_metal_view(view);
++    if (record)
++    {
++        client_surface_use(record->surface, FALSE);
++        client_surface_release(record->surface);
++        free(record);
++    }
++}
++/* DXMT resolves this stable table with dlsym, avoiding private Wine struct offsets. */
++__attribute__((visibility("default"))) const struct
++{
++    void (*init_display_devices)(BOOL);
++    struct dxmt_window_data *(*get_win_data)(HWND);
++    void (*release_win_data)(struct dxmt_window_data *);
++    WineWindow *(*get_cocoa_window)(HWND, BOOL);
++    id_MTLDevice (*create_metal_device)(void);
++    void (*release_metal_device)(id_MTLDevice);
++    WineMetalView *(*create_metal_view)(WineContentView *, id_MTLDevice);
++    CAMetalLayer *(*get_metal_layer)(WineMetalView *);
++    void (*release_metal_view)(WineMetalView *);
++    void *on_main_thread;
++} macdrv_functions =
++{
++    NULL, dxmt_get_win_data, dxmt_release_win_data, macdrv_get_cocoa_window,
++    macdrv_create_metal_device, macdrv_release_metal_device, dxmt_create_metal_view,
++    macdrv_view_get_metal_layer, dxmt_release_metal_view, NULL
++};
+--- a/dlls/winemac.drv/image.c
++++ b/dlls/winemac.drv/image.c
+@@ -256,6 +256,11 @@
+     unsigned count;
+     int i;
+ 
++    /* A packaged app may pin its native icon instead of adopting the first
++     * Windows executable icon. Returning no override retains CFBundleIconFile. */
++    if (CFBundleGetValueForInfoDictionaryKey(CFBundleGetMainBundle(), CFSTR("WineUseBundleIcon")) == kCFBooleanTrue)
++        return NULL;
++
+     TRACE("()\n");
+ 
+     if (KeUserDispatchCallback(&params, sizeof(params), (void**)&entries, &ret_len) ||
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -183,7 +183,10 @@
+     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
+     int                 pixel_format;           /* pixel format for GL */
+     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
++    CFMutableDictionaryRef remote_layer_children; /* CAContextID -> child HWND, for repositioning
++                                                   * hosted cross-process layers on resize */
+     unsigned int        on_screen : 1;          /* is window ordered in? (minimized or not) */
++    unsigned int        hidden_by_minimized_owner : 1; /* restore only popups we suppressed */
+     unsigned int        shaped : 1;             /* is window using a custom region shape? */
+     unsigned int        layered : 1;            /* is window layered and with valid attributes? */
+     unsigned int        ulw_layered : 1;        /* has UpdateLayeredWindow() been called for window? */
+@@ -197,6 +200,7 @@
+     struct client_surface   client;
+     WineContentView        *cocoa_view;
+     id_WineMetalSwapChain   metal_swapchain;
++    SIZE                   metal_size;
+ };
+ 
+ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -537,12 +537,16 @@
+ extern CAMetalLayer *macdrv_view_get_metal_layer(WineMetalView *view);
+ extern void macdrv_view_release_metal_view(WineMetalView *view);
+ extern id_WineMetalSwapChain macdrv_create_view_swapchain(WineContentView *view);
+-extern id_WineMetalSwapChain macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds);
++extern id_WineMetalSwapChain macdrv_create_offscreen_swapchain(void* hwnd, void* child, CGRect bounds);
+ extern CAMetalLayer *macdrv_swapchain_get_layer(id_WineMetalSwapChain swapchain);
++extern void macdrv_swapchain_set_size(id_WineMetalSwapChain swapchain, int width, int height);
+ extern void macdrv_destroy_swapchain(id_WineMetalSwapChain swapchain);
+-extern void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int context_id);
++extern void macdrv_window_create_ca_layer_host_view(WineWindow *window, unsigned int context_id,
++                                                    CGRect frame, double zpos, int zpos_valid);
++extern void macdrv_window_update_ca_layer_host_frame(WineWindow *window, unsigned int context_id,
++                                                     CGRect frame, double zpos, int zpos_valid);
+ extern void macdrv_window_release_ca_layer_host_view(WineWindow *window, unsigned int context_id);
+-extern void macdrv_create_remote_layer(void* hwnd, unsigned int context_id);
++extern void macdrv_create_remote_layer(void* hwnd, void* child, unsigned int context_id);
+ extern void macdrv_release_remote_layer(void* hwnd, unsigned int context_id);
+ extern bool macdrv_get_view_backing_size(WineContentView *view, int backing_size[2]);
+ extern void macdrv_set_view_backing_size(WineContentView *view, const int backing_size[2]);
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -510,8 +510,18 @@
+ {
+     struct macdrv_thread_data *data = macdrv_thread_data();
+     TISInputSourceRef input_source;
++    const char *qos;
++    CFBundleRef bundle;
++    CFStringRef identifier;
+ 
+     if (data) return data;
++
++    qos = getenv("NIKKE_GAME_QOS");
++    bundle = CFBundleGetMainBundle();
++    identifier = bundle ? CFBundleGetIdentifier(bundle) : NULL;
++    if (qos && !strcmp(qos, "1") && identifier
++            && CFEqual(identifier, CFSTR("org.winehq.nikke.unityprobe")))
++        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+ 
+     if (!(data = calloc(1, sizeof(*data))))
+     {
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -38,6 +38,103 @@
+ #include "wine/server.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
++
++/* Win32 paint order for the hosted children of one root; higher index = nearer the viewer.
++ * Siblings are walked bottom to top (GW_HWNDNEXT runs top to bottom) and a window is recorded
++ * before its own children, so a child sits above its parent and an upper sibling above the whole
++ * subtree of a lower one. Built once per update, not once per layer: this runs during a drag. */
++#define PAINT_ORDER_DEPTH 32
++
++struct paint_order
++{
++    HWND *hwnds;                   /* index 0 = furthest back; grown by doubling */
++    int   count, capacity;
++    BOOL  truncated;               /* a bound was hit; z-order below is incomplete */
++};
++
++/* An unlogged bound reads as "we ordered everything" when we did not; once per process, though,
++ * since this runs on the drag path. Layers past it keep their previous z. */
++static void paint_order_truncated(struct paint_order *po, const char *why, HWND at)
++{
++    static BOOL warned;
++
++    if (!warned)
++    {
++        FIXME("%s below %p -- paint order incomplete, hosted layers past the cap keep their z\n",
++              why, at);
++        warned = TRUE;
++    }
++    po->truncated = TRUE;
++}
++
++static BOOL paint_order_add(struct paint_order *po, HWND hwnd)
++{
++    if (po->count == po->capacity)
++    {
++        int capacity = po->capacity ? po->capacity * 2 : 32;
++        HWND *hwnds = realloc(po->hwnds, capacity * sizeof(*hwnds));
++
++        if (!hwnds)
++        {
++            paint_order_truncated(po, "out of memory", hwnd);
++            return FALSE;
++        }
++        po->hwnds = hwnds;
++        po->capacity = capacity;
++    }
++    po->hwnds[po->count++] = hwnd;
++    return TRUE;
++}
++
++/* GW_CHILD gives the topmost child and GW_HWNDLAST the bottommost sibling, so GW_HWNDPREV from
++ * there walks bottom to top. Recording a window before descending into it puts a child above its
++ * parent and an upper sibling above the whole subtree of a lower one, which is Win32 paint order
++ * -- in one pass, with no per-level array and no bound on breadth. */
++static void paint_order_walk(HWND parent, struct paint_order *po, int depth)
++{
++    HWND k;
++
++    if (depth >= PAINT_ORDER_DEPTH)
++    {
++        paint_order_truncated(po, "window tree too deep", parent);
++        return;
++    }
++
++    if (!(k = NtUserGetWindowRelative(parent, GW_CHILD))) return;
++
++    for (k = NtUserGetWindowRelative(k, GW_HWNDLAST); k;
++         k = NtUserGetWindowRelative(k, GW_HWNDPREV))
++    {
++        if (!paint_order_add(po, k)) return;
++        paint_order_walk(k, po, depth + 1);
++    }
++}
++
++static void build_paint_order(HWND root, struct paint_order *po)
++{
++    po->hwnds = NULL;
++    po->count = po->capacity = 0;
++    po->truncated = FALSE;
++    if (root) paint_order_walk(root, po, 0);
++}
++
++static void paint_order_free(struct paint_order *po)
++{
++    free(po->hwnds);
++    po->hwnds = NULL;
++    po->count = po->capacity = 0;
++}
++
++/* TRUE + *zpos on success; on failure the caller must leave zPosition alone. Returning 0.0 for
++ * "not found" would be indistinguishable from a legitimate bottom-most position. */
++static BOOL paint_order_zpos(const struct paint_order *po, HWND child, double *zpos)
++{
++    int i;
++
++    for (i = 0; i < po->count; i++)
++        if (po->hwnds[i] == child) { *zpos = (double)(i + 1); return TRUE; }
++    return FALSE;
++}
+ 
+ 
+ static pthread_mutex_t win_data_mutex;
+@@ -625,6 +722,15 @@
+ /***********************************************************************
+  *              show_window
+  */
++static void hide_window(struct macdrv_win_data *data);
++
++static BOOL has_minimized_owner(HWND hwnd)
++{
++    while ((hwnd = NtUserGetWindowRelative(hwnd, GW_OWNER)))
++        if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) return TRUE;
++    return FALSE;
++}
++
+ static void show_window(struct macdrv_win_data *data)
+ {
+     HWND prev = NULL;
+@@ -634,6 +740,17 @@
+     BOOL activate = FALSE;
+     GUITHREADINFO info;
+ 
++    /* An application's shadow/tool popups can remain WS_VISIBLE while their
++     * owner is iconic, and can even keep moving around its icon rectangle.
++     * Do not re-order those native windows onto the desktop. */
++    if (has_minimized_owner(data->hwnd))
++    {
++        if (data->on_screen) hide_window(data);
++        data->hidden_by_minimized_owner = TRUE;
++        return;
++    }
++    data->hidden_by_minimized_owner = FALSE;
++
+     /* find window that this one must be after */
+     prev = NtUserGetWindowRelative(data->hwnd, GW_HWNDPREV);
+     while (prev && !((NtUserGetWindowLongW(prev, GWL_STYLE) & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE &&
+@@ -675,6 +792,45 @@
+     if (data->cocoa_window)
+         macdrv_hide_cocoa_window(data->cocoa_window);
+     data->on_screen = FALSE;
++    data->hidden_by_minimized_owner = FALSE;
++}
++
++/* Cocoa detaches owned windows during miniaturization. Keep their native
++ * visibility in sync even when an application leaves WS_VISIBLE set. Windows
++ * visibility remains authoritative when restoring; never resurrect a hidden
++ * popup. win_data_mutex is recursive and held by the caller. */
++static void sync_owned_window_visibility(HWND owner)
++{
++    const void **keys;
++    CFIndex count, i;
++    struct macdrv_win_data *owned;
++
++    if (!win_datas || !(count = CFDictionaryGetCount(win_datas))) return;
++    if (!(keys = malloc(count * sizeof(*keys)))) return;
++    CFDictionaryGetKeysAndValues(win_datas, keys, NULL);
++    for (i = 0; i < count; ++i)
++    {
++        HWND hwnd = (HWND)keys[i];
++        if (hwnd == owner || !is_owned_by(hwnd, owner)) continue;
++        if (!(owned = get_win_data(hwnd))) continue;
++        if (owned->cocoa_window)
++        {
++            if (has_minimized_owner(hwnd))
++            {
++                if (owned->on_screen)
++                {
++                    hide_window(owned);
++                    owned->hidden_by_minimized_owner = TRUE;
++                }
++            }
++            else if (owned->hidden_by_minimized_owner && !owned->on_screen &&
++                     (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE) &&
++                     (owned->layered || !(NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)))
++                show_window(owned);
++        }
++        release_win_data(owned);
++    }
++    free(keys);
+ }
+ 
+ 
+@@ -842,6 +998,35 @@
+     return NtUserMonitorFromRect(&rect, flags);
+ }
+ 
++
++/* Retire every other hosted layer mirroring the same child, called once the replacement is in
++ * the layer tree. Retiring on the old swapchain's death instead leaves the child unhosted until
++ * the replacement's own message arrives, and the window shows straight through for that long. */
++static void retire_superseded_layers(struct macdrv_win_data *data, HWND child, unsigned int keep)
++{
++    CFIndex count, i;
++    const void **keys, **vals;
++
++    if (!data->remote_layer_children || !child) return;
++    if (!(count = CFDictionaryGetCount(data->remote_layer_children))) return;
++
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (!keys || !vals) { free(keys); free(vals); return; }
++    CFDictionaryGetKeysAndValues(data->remote_layer_children, keys, vals);
++
++    for (i = 0; i < count; i++)
++    {
++        unsigned int ctx = (unsigned int)(UINT_PTR)keys[i];
++
++        if (ctx == keep || (HWND)vals[i] != child) continue;
++        TRACE("retiring superseded layer ctx %u for child %p (replaced by %u)\n", ctx, child, keep);
++        if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, ctx);
++        CFDictionaryRemoveValue(data->remote_layer_children, (const void *)(UINT_PTR)ctx);
++    }
++    free(keys);
++    free(vals);
++}
+ 
+ /***********************************************************************
+  *              move_window
+@@ -1108,6 +1293,19 @@
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
++    if (surface->metal_swapchain)
++    {
++        int width = client->monitor_rect.right - client->monitor_rect.left;
++        int height = client->monitor_rect.bottom - client->monitor_rect.top;
++
++        if (width != surface->metal_size.cx || height != surface->metal_size.cy)
++        {
++            macdrv_swapchain_set_size(surface->metal_swapchain, width, height);
++            surface->metal_size.cx = width;
++            surface->metal_size.cy = height;
++        }
++    }
++
+     if (!(data = get_win_data(toplevel))) return;
+     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(client->monitor_rect));
+     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
+@@ -1151,6 +1349,7 @@
+     struct macdrv_client_surface *surface;
+ 
+     surface = client_surface_create(&macdrv_client_surface_funcs, hwnd, pixel_format, raw);
++    if (!surface) return NULL;
+     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
+     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
+ 
+@@ -1179,16 +1378,42 @@
+     {
+         RECT rect;
+ 
+-        if (NtUserGetAncestor(hwnd, GA_ROOT) != hwnd)
+-        {
+-            FIXME("Cross-process child window Metal swapchains are not implemented\n");
+-            return FALSE;
+-        }
++        HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+ 
+         if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
+-        surface->metal_swapchain = macdrv_create_offscreen_swapchain(hwnd, cgrect_from_rect(rect));
+-    }
+-
++
++        if (root && root != hwnd)
++        {
++            /* Cross-process child window: it has no cocoa_window of its own, so the CAContext
++             * is posted to its root, which owns an NSWindow and lives in the other process. The
++             * frame goes in the root's space -- the child's own client rect is (0,0,w,h) and
++             * would put every hosted layer at the root's origin -- computed as the update path
++             * computes it, so creation and every later move agree. */
++            RECT child_rect = rect, root_rect;
++            UINT geom_dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
++
++            if (NtUserGetWindowRect(hwnd, &child_rect, geom_dpi) &&
++                NtUserGetWindowRect(root, &root_rect, geom_dpi))
++                OffsetRect(&child_rect, -root_rect.left, -root_rect.top);
++            else
++                child_rect = rect;   /* fall back to the old behaviour rather than guess */
++
++            TRACE("cross-process child %p -> root %p frame %s\n", hwnd, root,
++                  wine_dbgstr_rect(&child_rect));
++            surface->metal_swapchain =
++                macdrv_create_offscreen_swapchain(root, hwnd, cgrect_from_rect(child_rect));
++        }
++        else
++            surface->metal_swapchain =
++                macdrv_create_offscreen_swapchain(hwnd, NULL, cgrect_from_rect(rect));
++    }
++
++    if (surface->metal_swapchain)
++    {
++        surface->metal_size.cx = surface->client.monitor_rect.right - surface->client.monitor_rect.left;
++        surface->metal_size.cy = surface->client.monitor_rect.bottom - surface->client.monitor_rect.top;
++        macdrv_swapchain_set_size(surface->metal_swapchain, surface->metal_size.cx, surface->metal_size.cy);
++    }
+     return surface->metal_swapchain != NULL;
+ }
+ 
+@@ -1270,6 +1495,9 @@
+ 
+     if (!(data = get_win_data(hwnd))) return;
+ 
++    if (data->remote_layer_children)
++        CFRelease(data->remote_layer_children);
++
+     if (data->drag_event) NtSetEvent(data->drag_event, NULL);
+ 
+     destroy_cocoa_window(data);
+@@ -1558,8 +1786,57 @@
+     case WM_MACDRV_CREATE_REMOTE_LAYER:
+         if ((data = get_win_data(hwnd)))
+         {
+-            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
+-            if (data->cocoa_window) macdrv_window_create_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
++            HWND child = (HWND)wp;
++            CGRect frame = CGRectNull;
++            BOOL host = TRUE;
++
++            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER child %p context_id %u\n", child,
++                  (unsigned int)lp);
++            if (child)
++            {
++                UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
++                RECT cr, rr;
++
++                if (NtUserGetWindowRect(child, &cr, dpi) && NtUserGetWindowRect(hwnd, &rr, dpi))
++                {
++                    OffsetRect(&cr, -rr.left, -rr.top);
++                    frame = CGRectMake(cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top);
++                    TRACE("child %p layer frame in root %p = %s\n", child, hwnd,
++                          wine_dbgstr_rect(&cr));
++                }
++                else
++                {
++                    /* the child went away between the post and this handler; with no rect the
++                     * layer would cover the whole content view with nothing ever drawn into it */
++                    TRACE("child %p gone before context %u could be hosted -- not hosting\n",
++                          child, (unsigned int)lp);
++                    host = FALSE;
++                }
++            }
++            if (host && data->cocoa_window)
++            {
++                struct paint_order po;
++                double zpos = 0.0;
++                BOOL have_z;
++
++                build_paint_order(hwnd, &po);
++                have_z = child && paint_order_zpos(&po, child, &zpos);
++                paint_order_free(&po);
++                macdrv_window_create_ca_layer_host_view(data->cocoa_window, (unsigned int)lp, frame,
++                                                       zpos, have_z);
++                /* Track every hosted layer: a child's so it can be repositioned on resize, and
++                 * a top-level's own (child NULL) so the release handler can tell "never tracked"
++                 * from "already retired". */
++                if (!data->remote_layer_children)
++                    data->remote_layer_children = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
++                if (data->remote_layer_children)
++                {
++                    CFDictionarySetValue(data->remote_layer_children,
++                                         (const void *)(UINT_PTR)(unsigned int)lp, child);
++                    /* the replacement is hosted now -- only now do its predecessors go */
++                    if (child) retire_superseded_layers(data, child, (unsigned int)lp);
++                }
++            }
+             release_win_data(data);
+         }
+         return 0;
+@@ -1567,7 +1844,18 @@
+         if ((data = get_win_data(hwnd)))
+         {
+             TRACE("WM_MACDRV_RELEASE_REMOTE_LAYER context_id %u\n", (unsigned int)lp);
+-            if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
++            /* Every hosted layer is tracked, so an untracked id is one retire_superseded_layers()
++             * already took, and skipping it keeps the two paths from racing over a reused id. */
++            if (!data->remote_layer_children ||
++                CFDictionaryContainsKey(data->remote_layer_children,
++                                        (const void *)(UINT_PTR)(unsigned int)lp))
++            {
++                if (data->cocoa_window)
++                    macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
++                if (data->remote_layer_children)
++                    CFDictionaryRemoveValue(data->remote_layer_children,
++                                            (const void *)(UINT_PTR)(unsigned int)lp);
++            }
+             release_win_data(data);
+         }
+         return 0;
+@@ -1578,9 +1866,11 @@
+ }
+ 
+ 
+-void macdrv_create_remote_layer(void* hwnd_ptr, unsigned int context_id)
+-{
+-    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, 0, context_id);
++void macdrv_create_remote_layer(void* hwnd_ptr, void* child_ptr, unsigned int context_id)
++{
++    /* wParam carries the cross-process child hwnd (0 for a root window) so the owning process
++     * can position the hosted layer; lParam is the CAContext id. */
++    NtUserPostMessage((HWND)hwnd_ptr, WM_MACDRV_CREATE_REMOTE_LAYER, (WPARAM)child_ptr, context_id);
+ }
+ 
+ 
+@@ -1636,6 +1926,119 @@
+ /***********************************************************************
+  *              WindowPosChanged   (MACDRV.@)
+  */
++
++/* Re-place the cross-process layers hosted on this window: they mirror children owned by another
++ * process, which are not managed windows, so no WindowPosChanged of their own ever arrives. */
++/* The context id of this root's hosted layer for this child, or 0. Same value scan
++ * update_remote_layer_frames does, without doing the work when the answer is no. */
++static unsigned int remote_layer_context_for(struct macdrv_win_data *data, HWND child)
++{
++    CFIndex count, i;
++    const void **keys, **vals;
++    unsigned int context_id = 0;
++
++    if (!data->remote_layer_children || !child) return 0;
++    if (!(count = CFDictionaryGetCount(data->remote_layer_children))) return 0;
++
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (keys && vals)
++    {
++        CFDictionaryGetKeysAndValues(data->remote_layer_children, keys, vals);
++        for (i = 0; i < count && !context_id; i++)
++            if ((HWND)vals[i] == child) context_id = (unsigned int)(UINT_PTR)keys[i];
++    }
++    free(keys);
++    free(vals);
++    return context_id;
++}
++
++/* Reposition ONE hosted layer. A child's own move only moves that child, and refreshing every
++ * layer on the root instead costs O(n) per child: during a resize the root moves, all n children
++ * move with it, and n full passes run where one pass would do. Measured on Steam's store page,
++ * that multiplier produced 9 near-black frames in 400 during churn where the same build without
++ * this path produced 0 in 320. The root's own WindowPosChanged still does the full pass. */
++static void update_remote_layer_frame_for(struct macdrv_win_data *data, HWND child,
++                                          unsigned int context_id)
++{
++    struct paint_order order;
++    RECT root_rect, cr;
++    double zpos = 0.0;
++    BOOL have_z;
++    UINT dpi;
++
++    if (!data->cocoa_window || !child || !context_id) return;
++    dpi = NtUserGetWinMonitorDpi(data->hwnd, MDT_RAW_DPI);
++    if (!NtUserGetWindowRect(data->hwnd, &root_rect, dpi)) return;
++    if (!NtUserGetWindowRect(child, &cr, dpi)) return;
++    OffsetRect(&cr, -root_rect.left, -root_rect.top);
++
++    build_paint_order(data->hwnd, &order);
++    have_z = paint_order_zpos(&order, child, &zpos);
++    paint_order_free(&order);
++
++    TRACE("child %p context %u frame %s zpos %.0f%s\n", child, context_id,
++          wine_dbgstr_rect(&cr), zpos, have_z ? "" : " (not in paint order)");
++    macdrv_window_update_ca_layer_host_frame(data->cocoa_window, context_id,
++        CGRectMake(cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top), zpos, have_z);
++}
++
++static void update_remote_layer_frames(struct macdrv_win_data *data)
++{
++    CFIndex count, i;
++    const void **keys, **vals;
++    RECT root_rect;
++    UINT dpi;
++    struct paint_order order;
++
++    if (!data->remote_layer_children || !data->cocoa_window) return;
++    if (!(count = CFDictionaryGetCount(data->remote_layer_children))) return;
++
++    dpi = NtUserGetWinMonitorDpi(data->hwnd, MDT_RAW_DPI);
++    if (!NtUserGetWindowRect(data->hwnd, &root_rect, dpi)) return;
++
++    /* one walk for all of this window's hosted layers, not one per layer */
++    build_paint_order(data->hwnd, &order);
++
++    keys = calloc(count, sizeof(*keys));
++    vals = calloc(count, sizeof(*vals));
++    if (!keys || !vals) { free(keys); free(vals); paint_order_free(&order); return; }
++    CFDictionaryGetKeysAndValues(data->remote_layer_children, keys, vals);
++
++    for (i = 0; i < count; i++)
++    {
++        HWND child = (HWND)vals[i];
++        unsigned int context_id = (unsigned int)(UINT_PTR)keys[i];
++        RECT cr;
++
++        if (!child) continue;   /* a top-level's own layer fills the content view and autoresizes */
++        if (!NtUserGetWindowRect(child, &cr, dpi))
++        {
++            /* the child is gone; left alone its layer would stay painted at its last frame */
++            TRACE("child %p gone -- releasing hosted layer %u\n", child, context_id);
++            macdrv_window_release_ca_layer_host_view(data->cocoa_window, context_id);
++            CFDictionaryRemoveValue(data->remote_layer_children,
++                                    (const void *)(UINT_PTR)context_id);
++            continue;
++        }
++        OffsetRect(&cr, -root_rect.left, -root_rect.top);
++        {
++            double zpos = 0.0;
++            BOOL have_z = paint_order_zpos(&order, child, &zpos);
++
++            TRACE("child %p context %u frame %s zpos %.0f%s\n", child, context_id,
++                  wine_dbgstr_rect(&cr), zpos, have_z ? "" : " (not in paint order)");
++
++            macdrv_window_update_ca_layer_host_frame(data->cocoa_window, context_id,
++                CGRectMake(cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top),
++                zpos, have_z);
++        }
++    }
++    free(keys);
++    free(vals);
++    paint_order_free(&order);
++}
++
+ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                              const struct window_rects *new_rects, struct window_surface *surface)
+ {
+@@ -1655,12 +2058,35 @@
+     TRACE("win %p/%p new_rects %s style %08x flags %08x surface %p\n", hwnd, data->cocoa_window,
+           debugstr_window_rects(new_rects), new_style, swp_flags, surface);
+ 
+-    if (!data->cocoa_window) goto done;
+-
+-    if (data->on_screen)
+-    {
+-        if ((swp_flags & SWP_HIDEWINDOW) && !(new_style & WS_VISIBLE))
+-            hide_window(data);
++    if (!data->cocoa_window)
++    {
++        /* A cross-process child has win_data but no cocoa_window of its own, and this hook runs in
++         * the thread that owns it -- the same thread that owns its root and hosts its layer, since
++         * a foreign SetWindowPos is marshalled here via WM_WINE_SETWINDOWPOS. So the owner already
++         * sees every child move and, before this branch, discarded it: a move or a z change with
++         * the root stationary left the hosted layer at its old rect until the root next moved. It
++         * only went unnoticed because the client re-creates its swapchain on every resize.
++         * swp_flags here are the effective flags after fixup_swp_flags, so a no-op call already
++         * carries NOMOVE|NOSIZE|NOZORDER and costs nothing. */
++        HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
++        BOOL moved = (~swp_flags & (SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)) ||
++                     (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW));
++
++        release_win_data(data);   /* release the child before taking the root: win_data_mutex is
++                                   * recursive, so single-level lock scopes are a preference here,
++                                   * not a requirement */
++        if (moved && root && root != hwnd && (data = get_win_data(root)))
++        {
++            update_remote_layer_frame_for(data, hwnd, remote_layer_context_for(data, hwnd));
++            release_win_data(data);
++        }
++        return;
++    }
++
++    if ((swp_flags & SWP_HIDEWINDOW) && !(new_style & WS_VISIBLE))
++    {
++        if (data->on_screen) hide_window(data);
++        data->hidden_by_minimized_owner = FALSE;
+     }
+ 
+     /* check if we are currently processing an event relevant to this window */
+@@ -1688,6 +2114,13 @@
+         }
+     }
+ 
++    /* after the Cocoa frame is current, so hosted cross-process layers are placed against the
++     * content view's new bounds rather than the ones it is about to leave */
++    update_remote_layer_frames(data);
++
++    if (swp_flags & SWP_STATECHANGED)
++        sync_owned_window_visibility(hwnd);
++
+     if (fullscreen || fullscreen != data->fullscreen)
+     {
+         CGRect rect = (fullscreen && !EqualRect(&data->rects.window, &data->rects.visible)) ? cgrect_from_rect(data->rects.window) : CGRectZero;
+@@ -1695,7 +2128,6 @@
+         data->fullscreen = fullscreen;
+     }
+ 
+-done:
+     release_win_data(data);
+ }
+ 
+--- a/include/ddk/wdm.h
++++ b/include/ddk/wdm.h
+@@ -919,6 +919,18 @@
+ } DRIVER_REGKEY_TYPE, *PDRIVER_REGKEY_TYPE;
+ 
+ typedef LARGE_INTEGER PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
++
++typedef struct _MM_COPY_ADDRESS
++{
++    union
++    {
++        void *VirtualAddress;
++        PHYSICAL_ADDRESS PhysicalAddress;
++    } DUMMYUNIONNAME;
++} MM_COPY_ADDRESS, *PMMCOPY_ADDRESS;
++
++#define MM_COPY_MEMORY_PHYSICAL 0x1
++#define MM_COPY_MEMORY_VIRTUAL  0x2
+ 
+ #define IO_RESOURCE_PREFERRED             0x01
+ #define IO_RESOURCE_DEFAULT               0x02
+@@ -1656,6 +1668,8 @@
+ typedef EX_CALLBACK_FUNCTION *PEX_CALLBACK_FUNCTION;
+ 
+ typedef ULONG OB_OPERATION;
++#define OB_OPERATION_HANDLE_CREATE    0x1
++#define OB_OPERATION_HANDLE_DUPLICATE 0x2
+ 
+ typedef struct _OB_PRE_CREATE_HANDLE_INFORMATION {
+     ACCESS_MASK DesiredAccess;
+@@ -1764,6 +1778,14 @@
+     HyperCriticalWorkQueue,
+     MaximumWorkQueue
+ } WORK_QUEUE_TYPE;
++
++typedef void (WINAPI *PWORKER_THREAD_ROUTINE)(void *);
++typedef struct _WORK_QUEUE_ITEM
++{
++    LIST_ENTRY List;
++    PWORKER_THREAD_ROUTINE WorkerRoutine;
++    void *Parameter;
++} WORK_QUEUE_ITEM, *PWORK_QUEUE_ITEM;
+ 
+ typedef void (WINAPI *PIO_WORKITEM_ROUTINE)(PDEVICE_OBJECT,void*);
+ 
+@@ -2004,6 +2026,7 @@
+ PMDL      WINAPI MmAllocatePagesForMdl(PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,PHYSICAL_ADDRESS,SIZE_T);
+ void      WINAPI MmBuildMdlForNonPagedPool(MDL*);
+ NTSTATUS  WINAPI MmCopyVirtualMemory(PEPROCESS,void*,PEPROCESS,void*,SIZE_T,KPROCESSOR_MODE,SIZE_T*);
++NTSTATUS  WINAPI MmCopyMemory(void*,MM_COPY_ADDRESS,SIZE_T,ULONG,SIZE_T*);
+ void *    WINAPI MmGetSystemRoutineAddress(UNICODE_STRING*);
+ PVOID     WINAPI MmMapLockedPages(MDL*,KPROCESSOR_MODE);
+ PVOID     WINAPI MmMapLockedPagesSpecifyCache(PMDLX,KPROCESSOR_MODE,MEMORY_CACHING_TYPE,PVOID,ULONG,MM_PAGE_PRIORITY);
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -278,6 +278,7 @@
+ W32KAPI void client_surface_add_ref( struct client_surface *surface );
+ W32KAPI void client_surface_release( struct client_surface *surface );
+ W32KAPI void client_surface_present( struct client_surface *surface );
++W32KAPI void client_surface_use( struct client_surface *surface, BOOL use );
+ W32KAPI void update_client_surfaces( HWND hwnd );
+ W32KAPI void detach_client_surfaces( HWND hwnd );
+ 
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -383,6 +383,14 @@
+ {
+     struct luid  luid;
+     unsigned int attrs;
++};
++
++struct kernel_module_info
++{
++    client_ptr_t base;
++    mem_size_t   size;
++    data_size_t  name_len;
++
+ };
+ 
+ struct acl
+@@ -5423,6 +5431,45 @@
+     struct reply_header __header;
+ };
+ 
++
++struct register_kernel_module_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++    client_ptr_t base;
++    mem_size_t   size;
++    /* VARARG(name,unicode_str); */
++};
++struct register_kernel_module_reply
++{
++    struct reply_header __header;
++};
++
++
++struct unregister_kernel_module_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++    client_ptr_t base;
++};
++struct unregister_kernel_module_reply
++{
++    struct reply_header __header;
++};
++
++
++struct list_kernel_modules_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct list_kernel_modules_reply
++{
++    struct reply_header __header;
++    unsigned int module_count;
++    data_size_t  info_size;
++    /* VARARG(info,kernel_module_info); */
++};
+ 
+ 
+ struct grab_kernel_object_request
+@@ -6503,6 +6550,9 @@
+     REQ_get_next_device_request,
+     REQ_get_kernel_object_ptr,
+     REQ_set_kernel_object_ptr,
++    REQ_register_kernel_module,
++    REQ_unregister_kernel_module,
++    REQ_list_kernel_modules,
+     REQ_grab_kernel_object,
+     REQ_release_kernel_object,
+     REQ_get_kernel_object_handle,
+@@ -6818,6 +6868,9 @@
+     struct get_next_device_request_request get_next_device_request_request;
+     struct get_kernel_object_ptr_request get_kernel_object_ptr_request;
+     struct set_kernel_object_ptr_request set_kernel_object_ptr_request;
++    struct register_kernel_module_request register_kernel_module_request;
++    struct unregister_kernel_module_request unregister_kernel_module_request;
++    struct list_kernel_modules_request list_kernel_modules_request;
+     struct grab_kernel_object_request grab_kernel_object_request;
+     struct release_kernel_object_request release_kernel_object_request;
+     struct get_kernel_object_handle_request get_kernel_object_handle_request;
+@@ -7131,6 +7184,9 @@
+     struct get_next_device_request_reply get_next_device_request_reply;
+     struct get_kernel_object_ptr_reply get_kernel_object_ptr_reply;
+     struct set_kernel_object_ptr_reply set_kernel_object_ptr_reply;
++    struct register_kernel_module_reply register_kernel_module_reply;
++    struct unregister_kernel_module_reply unregister_kernel_module_reply;
++    struct list_kernel_modules_reply list_kernel_modules_reply;
+     struct grab_kernel_object_reply grab_kernel_object_reply;
+     struct release_kernel_object_reply release_kernel_object_reply;
+     struct get_kernel_object_handle_reply get_kernel_object_handle_reply;
+@@ -7184,6 +7240,6 @@
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 962
++#define SERVER_PROTOCOL_VERSION 963
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/include/wine/wined3d.h
++++ b/include/wine/wined3d.h
+@@ -1060,6 +1060,7 @@
+ #define WINED3DCREATE_ENABLE_PRESENTSTATS                       0x00004000
+ #define WINED3DCREATE_DISABLE_PRINTSCREEN                       0x00008000
+ #define WINED3DCREATE_SCREENSAVER                               0x10000000
++#define WINED3DCREATE_VIDEO_SUPPORT                             0x20000000
+ 
+ /* VTF defines */
+ #define WINED3DDMAPSAMPLER                                      0x100
+--- a/server/device.c
++++ b/server/device.c
+@@ -37,6 +37,20 @@
+ #include "handle.h"
+ #include "request.h"
+ #include "process.h"
++
++/* loaded kernel module */
++
++struct kernel_module
++{
++    struct list      entry;      /* entry in kernel_modules list */
++    struct process  *owner;      /* process that registered it, not a reference */
++    client_ptr_t     base;       /* module base address in the owner process */
++    mem_size_t       size;       /* module size */
++    WCHAR           *name;       /* module name */
++    data_size_t      name_len;   /* length of name in bytes */
++};
++
++static struct list kernel_modules = LIST_INIT(kernel_modules);
+ 
+ /* IRP object */
+ 
+@@ -825,6 +839,22 @@
+ }
+ 
+ 
++/* remove the modules of a process that is going away, a winedevice may
++ * die without unloading its drivers */
++void free_kernel_modules( struct process *process )
++{
++    struct kernel_module *module, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( module, next, &kernel_modules, struct kernel_module, entry )
++    {
++        if (module->owner != process) continue;
++        list_remove( &module->entry );
++        free( module->name );
++        free( module );
++    }
++}
++
++
+ /* create a device manager */
+ DECL_HANDLER(create_device_manager)
+ {
+@@ -1105,3 +1135,83 @@
+ 
+     release_object( manager );
+ }
++
++
++/* register a newly loaded kernel module */
++DECL_HANDLER(register_kernel_module)
++{
++    struct kernel_module *module;
++
++    if (!(module = mem_alloc( sizeof(*module) ))) return;
++
++    module->name_len = get_req_data_size();
++    module->name = NULL;
++
++    if (module->name_len && !(module->name = memdup( get_req_data(), module->name_len )))
++    {
++        free( module );
++        return;
++    }
++
++    module->owner = current->process;
++    module->base = req->base;
++    module->size = req->size;
++    list_add_tail( &kernel_modules, &module->entry );
++}
++
++
++/* unregister a kernel module that is being unloaded */
++DECL_HANDLER(unregister_kernel_module)
++{
++    struct kernel_module *module;
++
++    /* a module is identified by its base address within its owner process */
++    LIST_FOR_EACH_ENTRY( module, &kernel_modules, struct kernel_module, entry )
++    {
++        if (module->base == req->base && module->owner == current->process)
++        {
++            list_remove( &module->entry );
++            free( module->name );
++            free( module );
++            return;
++        }
++    }
++}
++
++
++/* return the list of currently loaded kernel modules */
++DECL_HANDLER(list_kernel_modules)
++{
++    struct kernel_module *module;
++    char *data;
++
++    LIST_FOR_EACH_ENTRY( module, &kernel_modules, struct kernel_module, entry )
++    {
++        reply->module_count++;
++        reply->info_size += (sizeof(struct kernel_module_info) + module->name_len
++                             + sizeof(client_ptr_t)-1) / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++    }
++
++    if (reply->info_size > get_reply_max_size())
++    {
++        set_error( STATUS_INFO_LENGTH_MISMATCH );
++        return;
++    }
++
++    if (!(data = set_reply_data_size( reply->info_size ))) return;
++
++    memset( data, 0, reply->info_size );
++
++    LIST_FOR_EACH_ENTRY( module, &kernel_modules, struct kernel_module, entry )
++    {
++        struct kernel_module_info *info = (struct kernel_module_info *)data;
++
++        info->base     = module->base;
++        info->size     = module->size;
++        info->name_len = module->name_len;
++        memcpy( info + 1, module->name, module->name_len );
++        data += (sizeof(*info) + module->name_len
++                 + sizeof(client_ptr_t)-1) / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++    }
++}
++
+--- a/server/object.h
++++ b/server/object.h
+@@ -177,6 +177,7 @@
+ extern void unlink_named_object( struct object *obj );
+ extern struct namespace *create_namespace( unsigned int hash_size );
+ extern void free_kernel_objects( struct object *obj );
++extern void free_kernel_modules( struct process *process );
+ /* grab/release_object can take any pointer, but you better make sure */
+ /* that the thing pointed to starts with a struct object... */
+ extern struct object *grab_object( void *obj );
+--- a/server/process.c
++++ b/server/process.c
+@@ -726,6 +726,7 @@
+ 
+     close_process_handles( process );
+     set_process_startup_state( process, STARTUP_ABORTED );
++    free_kernel_modules( process );
+ 
+     if (process->job)
+     {
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -401,6 +401,14 @@
+     unsigned int attrs;
+ };
+ 
++struct kernel_module_info
++{
++    client_ptr_t base;
++    mem_size_t   size;
++    data_size_t  name_len;
++    /* VARARG(name,unicode_str,name_len); */
++};
++
+ struct acl
+ {
+     unsigned char  revision;
+@@ -3847,6 +3855,25 @@
+     client_ptr_t user_ptr;        /* kernel object pointer */
+ @END
+ 
++/* Register a loaded kernel module */
++@REQ(register_kernel_module)
++    client_ptr_t base;            /* module base address */
++    mem_size_t   size;            /* module size */
++    VARARG(name,unicode_str);     /* module name */
++@END
++
++/* Unregister a kernel module */
++@REQ(unregister_kernel_module)
++    client_ptr_t base;            /* module base address */
++@END
++
++/* Return the list of loaded kernel modules */
++@REQ(list_kernel_modules)
++@REPLY
++    unsigned int module_count;    /* number of modules */
++    data_size_t  info_size;       /* total size of module info */
++    VARARG(info,kernel_module_info); /* module info */
++@END
+ 
+ /* Grab server object reference from kernel object pointer */
+ @REQ(grab_kernel_object)
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -264,6 +264,9 @@
+ DECL_HANDLER(get_next_device_request);
+ DECL_HANDLER(get_kernel_object_ptr);
+ DECL_HANDLER(set_kernel_object_ptr);
++DECL_HANDLER(register_kernel_module);
++DECL_HANDLER(unregister_kernel_module);
++DECL_HANDLER(list_kernel_modules);
+ DECL_HANDLER(grab_kernel_object);
+ DECL_HANDLER(release_kernel_object);
+ DECL_HANDLER(get_kernel_object_handle);
+@@ -576,6 +579,9 @@
+     (req_handler)req_get_next_device_request,
+     (req_handler)req_get_kernel_object_ptr,
+     (req_handler)req_set_kernel_object_ptr,
++    (req_handler)req_register_kernel_module,
++    (req_handler)req_unregister_kernel_module,
++    (req_handler)req_list_kernel_modules,
+     (req_handler)req_grab_kernel_object,
+     (req_handler)req_release_kernel_object,
+     (req_handler)req_get_kernel_object_handle,
+@@ -2132,6 +2138,15 @@
+ C_ASSERT( offsetof(struct set_kernel_object_ptr_request, handle) == 16 );
+ C_ASSERT( offsetof(struct set_kernel_object_ptr_request, user_ptr) == 24 );
+ C_ASSERT( sizeof(struct set_kernel_object_ptr_request) == 32 );
++C_ASSERT( offsetof(struct register_kernel_module_request, base) == 16 );
++C_ASSERT( offsetof(struct register_kernel_module_request, size) == 24 );
++C_ASSERT( sizeof(struct register_kernel_module_request) == 32 );
++C_ASSERT( offsetof(struct unregister_kernel_module_request, base) == 16 );
++C_ASSERT( sizeof(struct unregister_kernel_module_request) == 24 );
++C_ASSERT( sizeof(struct list_kernel_modules_request) == 16 );
++C_ASSERT( offsetof(struct list_kernel_modules_reply, module_count) == 8 );
++C_ASSERT( offsetof(struct list_kernel_modules_reply, info_size) == 12 );
++C_ASSERT( sizeof(struct list_kernel_modules_reply) == 16 );
+ C_ASSERT( offsetof(struct grab_kernel_object_request, manager) == 12 );
+ C_ASSERT( offsetof(struct grab_kernel_object_request, user_ptr) == 16 );
+ C_ASSERT( sizeof(struct grab_kernel_object_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -30,6 +30,7 @@
+ static void dump_varargs_filesystem_event( const char *prefix, data_size_t size );
+ static void dump_varargs_handle_infos( const char *prefix, data_size_t size );
+ static void dump_varargs_ints( const char *prefix, data_size_t size );
++static void dump_varargs_kernel_module_info( const char *prefix, data_size_t size );
+ static void dump_varargs_luid_attr( const char *prefix, data_size_t size );
+ static void dump_varargs_message_data( const char *prefix, data_size_t size );
+ static void dump_varargs_monitor_infos( const char *prefix, data_size_t size );
+@@ -3016,6 +3017,29 @@
+     fprintf( stderr, " manager=%04x", req->manager );
+     fprintf( stderr, ", handle=%04x", req->handle );
+     dump_uint64( ", user_ptr=", &req->user_ptr );
++}
++
++static void dump_register_kernel_module_request( const struct register_kernel_module_request *req )
++{
++    dump_uint64( " base=", &req->base );
++    dump_uint64( ", size=", &req->size );
++    dump_varargs_unicode_str( ", name=", cur_size );
++}
++
++static void dump_unregister_kernel_module_request( const struct unregister_kernel_module_request *req )
++{
++    dump_uint64( " base=", &req->base );
++}
++
++static void dump_list_kernel_modules_request( const struct list_kernel_modules_request *req )
++{
++}
++
++static void dump_list_kernel_modules_reply( const struct list_kernel_modules_reply *req )
++{
++    fprintf( stderr, " module_count=%08x", req->module_count );
++    fprintf( stderr, ", info_size=%u", req->info_size );
++    dump_varargs_kernel_module_info( ", info=", cur_size );
+ }
+ 
+ static void dump_grab_kernel_object_request( const struct grab_kernel_object_request *req )
+@@ -3799,6 +3823,9 @@
+     (dump_func)dump_get_next_device_request_request,
+     (dump_func)dump_get_kernel_object_ptr_request,
+     (dump_func)dump_set_kernel_object_ptr_request,
++    (dump_func)dump_register_kernel_module_request,
++    (dump_func)dump_unregister_kernel_module_request,
++    (dump_func)dump_list_kernel_modules_request,
+     (dump_func)dump_grab_kernel_object_request,
+     (dump_func)dump_release_kernel_object_request,
+     (dump_func)dump_get_kernel_object_handle_request,
+@@ -4111,6 +4138,9 @@
+     (dump_func)dump_get_next_device_request_reply,
+     (dump_func)dump_get_kernel_object_ptr_reply,
+     NULL,
++    NULL,
++    NULL,
++    (dump_func)dump_list_kernel_modules_reply,
+     NULL,
+     NULL,
+     (dump_func)dump_get_kernel_object_handle_reply,
+@@ -4423,6 +4453,9 @@
+     "get_next_device_request",
+     "get_kernel_object_ptr",
+     "set_kernel_object_ptr",
++    "register_kernel_module",
++    "unregister_kernel_module",
++    "list_kernel_modules",
+     "grab_kernel_object",
+     "release_kernel_object",
+     "get_kernel_object_handle",
+--- a/server/trace.c
++++ b/server/trace.c
+@@ -1686,6 +1686,29 @@
+     remove_data( sizeof(*info) );
+ }
+ 
++static void dump_varargs_kernel_module_info( const char *prefix, data_size_t size )
++{
++    fprintf( stderr, "%s{", prefix );
++    while (size)
++    {
++        const struct kernel_module_info *info = cur_data;
++        data_size_t len;
++        if (size < sizeof(*info)) break;
++        len = (sizeof(*info) + info->name_len + sizeof(client_ptr_t)-1)
++              / sizeof(client_ptr_t) * sizeof(client_ptr_t);
++        if (size < len) break;
++        dump_uint64( "{base=", &info->base );
++        dump_uint64( ",size=", &info->size );
++        fprintf( stderr, ",name=L\"" );
++        dump_strW( (const WCHAR *)(info + 1), info->name_len, stderr, "\"\"" );
++        fprintf( stderr, "\"}" );
++        size -= len;
++        remove_data( len );
++        if (size) fputc( ',', stderr );
++    }
++    fputc( '}', stderr );
++}
++
+ void trace_request(void)
+ {
+     enum request req = current->req.request_header.req;

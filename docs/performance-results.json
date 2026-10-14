@@ -1,0 +1,131 @@
+{
+  "constant_60_verified": false,
+  "combat_samples": [
+    {
+      "stage": "2-5",
+      "route": "WineD3D/max",
+      "window_s": 8.983221916016191,
+      "frames": 403,
+      "fps": 44.75009119871279,
+      "p99_ms": 33.33300002850592,
+      "worst_ms": 49.99941599089652,
+      "intervals_gt_20ms": 148,
+      "intervals_gt_33_4ms": 4
+    },
+    {
+      "stage": "2-6",
+      "route": "WineD3D/balanced",
+      "window_s": 8.983229040983133,
+      "frames": 457,
+      "fps": 50.761257218272476,
+      "p99_ms": 24.99979198910296,
+      "worst_ms": 33.33300002850592,
+      "intervals_gt_20ms": 164,
+      "intervals_gt_33_4ms": 0
+    },
+    {
+      "stage": "2-9",
+      "route": "DXMT/balanced",
+      "window_s": 22.691415833076462,
+      "frames": 1356,
+      "fps": 59.7142113109075,
+      "p99_ms": 16.66658406611532,
+      "worst_ms": 33.33300002850592,
+      "intervals_gt_20ms": 11,
+      "intervals_gt_33_4ms": 0
+    },
+    {
+      "stage": "2-10",
+      "route": "DXMT/balanced",
+      "window_s": 19.07479179208167,
+      "frames": 1116,
+      "fps": 58.454111172152295,
+      "p99_ms": 24.99974996317178,
+      "worst_ms": 258.33045900799334,
+      "intervals_gt_20ms": 19,
+      "intervals_gt_33_4ms": 5
+    },
+    {
+      "stage": "2-11",
+      "route": "DXMT/effects-off",
+      "window_s": 19.083124959026463,
+      "frames": 1079,
+      "fps": 56.48969979049987,
+      "p99_ms": 24.99979198910296,
+      "worst_ms": 66.6658750269562,
+      "intervals_gt_20ms": 122,
+      "intervals_gt_33_4ms": 3
+    },
+    {
+      "stage": "Simulation 1-A / stage 1",
+      "route": "DXMT/effects-off/QoS experiment",
+      "window_s": 19.716450958978385,
+      "frames": 1161,
+      "fps": 58.83411788528628,
+      "p99_ms": 24.99974996317178,
+      "worst_ms": 74.9991670018062,
+      "intervals_gt_20ms": 35,
+      "intervals_gt_33_4ms": 2
+    },
+    {
+      "stage": "Simulation 1-A / stage 2",
+      "route": "DXMT/basic/all-worker-QoS; reverted",
+      "window_s": 14.083180333022028,
+      "frames": 829,
+      "fps": 58.793538137015695,
+      "p99_ms": 24.99974996317178,
+      "worst_ms": 41.66629200335592,
+      "intervals_gt_20ms": 28,
+      "intervals_gt_33_4ms": 2
+    },
+    {
+      "stage": "Simulation 1-A / stage 3",
+      "route": "DXMT/basic/Metal cap120/game60",
+      "window_s": 14.099846584023908,
+      "frames": 841,
+      "fps": 59.57511629607215,
+      "p99_ms": 24.999791057780385,
+      "worst_ms": 49.99945790041238,
+      "intervals_gt_20ms": 66,
+      "intervals_gt_33_4ms": 2
+    },
+    {
+      "stage": "Simulation 1-A / stage 5",
+      "route": "DXMT/basic/display60; ProMotion subsequently restored",
+      "window_s": 14.099847540957853,
+      "frames": 803,
+      "fps": 56.88004765089235,
+      "p99_ms": 33.33300002850592,
+      "worst_ms": 249.99733397271484,
+      "intervals_gt_20ms": 31,
+      "intervals_gt_33_4ms": 1
+    }
+  ],
+  "metal_combat_timing": {
+    "gpu": {
+      "frames": 1117,
+      "weighted_average_ms": 5.476512649955237,
+      "max_ms": 29.627333
+    },
+    "cpu": {
+      "frames": 1117,
+      "weighted_average_ms": 2.5799009562724318,
+      "max_ms": 34.68325000721961
+    },
+    "gpu_end_to_end": {
+      "frames": 1117,
+      "weighted_average_ms": 6.251180653615405,
+      "max_ms": 34.99099996406585
+    },
+    "drawable": {
+      "frames": 1117,
+      "weighted_average_ms": 1.256839943767901,
+      "max_ms": 14.694749959744513
+    },
+    "glass": {
+      "frames": 1117,
+      "weighted_average_ms": 17.00220132051094,
+      "max_ms": 74.99916665256023
+    }
+  }
+}

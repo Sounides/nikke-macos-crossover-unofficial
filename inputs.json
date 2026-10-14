@@ -1,0 +1,38 @@
+[
+  {
+    "file": "wine-11.18.tar.gz",
+    "url": "https://github.com/wine-mirror/wine/archive/refs/tags/wine-11.18.tar.gz",
+    "sha256": "74f32ddff773268fa39f47d0e33c063dc49d043624888c349a04a7630beebf11",
+    "bytes": 75595811
+  },
+  {
+    "file": "llvm-mingw.tar.xz",
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-macos-universal.tar.xz",
+    "sha256": "a7a19b11048e89372637d26279cdb7c430ed3cf8c1e224310421312bf986ebf6",
+    "bytes": 124399776
+  },
+  {
+    "file": "crossover-sources-26.3.0.tar.gz",
+    "url": "https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.3.0.tar.gz",
+    "sha256": "ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872",
+    "bytes": 149054023
+  },
+  {
+    "file": "bison.tar.xz",
+    "url": "https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz",
+    "sha256": "9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2",
+    "bytes": 2817324
+  },
+  {
+    "file": "gstreamer-1.0-1.28.8-universal.pkg",
+    "url": "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.8/gstreamer-1.0-1.28.8-universal.pkg",
+    "sha256": "d371ab04a7632713626836c2fc234e863cc98484c74c473eba99b0fbd9b3a3fe",
+    "bytes": 156581817
+  },
+  {
+    "file": "gstreamer-1.0-devel-1.28.8-universal.pkg",
+    "url": "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.8/gstreamer-1.0-devel-1.28.8-universal.pkg",
+    "sha256": "e6d380bc17be7eccf13e0154567d4718fc9321da822408c7ca0cd808b3d4a3f7",
+    "bytes": 808552628
+  }
+]
